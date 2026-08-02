@@ -263,6 +263,16 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
             argv.get(1)
                 .map_or(Ok(ResizeDirection::Grow), |arg| parse_resize_direction(arg))?,
         ),
+        "setwidth" => {
+            let [_, ratio] = argv else {
+                return Err(err);
+            };
+            let ratio = ratio.parse::<f64>().map_err(|_| err.clone())?;
+            if !ratio.is_finite() || ratio <= 0.0 {
+                return Err(err);
+            }
+            Operation::SetWidth(ratio)
+        }
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
         "fullwidth" => Operation::FullWidth,
@@ -1960,6 +1970,25 @@ fn test_parse_resize_commands() {
         parse_command(&["window", "shrink"]).unwrap(),
         Command::Window(Operation::Resize(ResizeDirection::Shrink))
     ));
+}
+
+#[test]
+fn test_parse_setwidth_command() {
+    assert!(matches!(
+        parse_command(&["window", "setwidth", "0.5"]),
+        Ok(Command::Window(Operation::SetWidth(ratio))) if (ratio - 0.5).abs() < f64::EPSILON
+    ));
+
+    for argv in [
+        ["window", "setwidth"].as_slice(),
+        ["window", "setwidth", "0.5", "extra"].as_slice(),
+        ["window", "setwidth", "0"].as_slice(),
+        ["window", "setwidth", "-0.5"].as_slice(),
+        ["window", "setwidth", "NaN"].as_slice(),
+        ["window", "setwidth", "inf"].as_slice(),
+    ] {
+        assert!(parse_command(argv).is_err(), "{argv:?} should be invalid");
+    }
 }
 
 #[test]

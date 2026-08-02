@@ -84,6 +84,12 @@ pub enum SubCmd {
         cmd: Vec<String>,
     },
 
+    /// Sends a command and waits for the daemon to accept or reject it.
+    ExecCmd {
+        #[arg(trailing_var_arg = true)]
+        cmd: Vec<String>,
+    },
+
     /// Queries structured state from the running daemon.
     Query {
         #[clap(subcommand)]
@@ -174,6 +180,7 @@ fn main() -> Result<()> {
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
         SubCmd::SendCmd { cmd } => CommandReader::send_command(cmd)?,
+        SubCmd::ExecCmd { cmd } => CommandReader::execute_command(cmd)?,
         SubCmd::Query { query } => {
             let output = CommandReader::send_query(query.kind())?;
             print!("{output}");

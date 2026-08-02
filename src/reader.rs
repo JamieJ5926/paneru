@@ -4,12 +4,20 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
 use crate::config::parse_command;
 use crate::ecs::state::StateQueryKind;
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
+
+#[derive(Deserialize, Serialize)]
+struct CommandResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
 /// `CommandReader` is responsible for sending and receiving commands via a Unix socket.
 /// It acts as an IPC mechanism for the `paneru` application, allowing external processes
@@ -35,6 +43,31 @@ impl CommandReader {
     pub fn send_command(params: impl IntoIterator<Item = String>) -> Result<()> {
         let _stream = Self::send_socket_request(params)?;
         Ok(())
+    }
+
+    pub fn execute_command(params: impl IntoIterator<Item = String>) -> Result<()> {
+        let mut stream = Self::send_socket_request(
+            std::iter::once("exec-cmd".to_string()).chain(params),
+        )?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+        let mut output = String::new();
+        stream.read_to_string(&mut output)?;
+        let output = output.trim();
+        if output.is_empty() {
+            return Err(Error::Generic("empty exec-cmd response".to_string()));
+        }
+
+        let response: CommandResponse = serde_json::from_str(output)?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(Error::Generic(
+                response
+                    .error
+                    .unwrap_or_else(|| "exec-cmd was not accepted".to_string()),
+            ))
+        }
     }
 
     pub fn send_query(kind: StateQueryKind) -> Result<String> {
@@ -106,80 +139,104 @@ impl CommandReader {
         let listener = UnixListener::bind(CommandReader::SOCKET_PATH)?;
 
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream.inspect_err(|err| error!("reading stream {err}")) else {
+            let Ok(stream) = stream.inspect_err(|err| error!("reading stream {err}")) else {
                 continue;
             };
-            let mut buffer = [0u8; 4];
-
-            if !full_read(&mut stream, buffer.len(), &mut buffer) {
-                continue;
+            if let Err(err) = self.handle_connection(stream) {
+                error!("handling stream: {err}");
             }
-            let size = u32::from_le_bytes(buffer) as usize;
-            let mut buffer = vec![0u8; size];
+        }
+        Ok(())
+    }
 
-            if !full_read(&mut stream, buffer.len(), &mut buffer) {
-                continue;
-            }
-            let argv = buffer
-                .split(|c| *c == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string())
-                .collect::<Vec<_>>();
-            let argv_ref = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    fn handle_connection(&self, mut stream: UnixStream) -> Result<()> {
+        let mut buffer = [0u8; 4];
 
-            if let Some(kind) = parse_query_request(&argv_ref) {
-                let (tx, rx) = channel();
-                _ = self
-                    .events
-                    .send(Event::StateQuery {
-                        kind,
-                        respond_to: tx,
-                    })
-                    .inspect_err(|err| {
-                        error!("sending state query: {err}");
-                    });
+        if !full_read(&mut stream, buffer.len(), &mut buffer) {
+            return Ok(());
+        }
+        let size = u32::from_le_bytes(buffer) as usize;
+        let mut buffer = vec![0u8; size];
 
-                match rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(response) => {
-                        _ = stream.write_all(response.as_bytes());
-                        _ = stream.write_all(b"\n");
-                    }
-                    Err(err) => error!("waiting for state query response: {err}"),
+        if !full_read(&mut stream, buffer.len(), &mut buffer) {
+            return Ok(());
+        }
+        let argv = buffer
+            .split(|c| *c == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect::<Vec<_>>();
+        let argv_ref = argv.iter().map(String::as_str).collect::<Vec<_>>();
+
+        if let Some(kind) = parse_query_request(&argv_ref) {
+            let (tx, rx) = channel();
+            _ = self
+                .events
+                .send(Event::StateQuery {
+                    kind,
+                    respond_to: tx,
+                })
+                .inspect_err(|err| {
+                    error!("sending state query: {err}");
+                });
+
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(response) => {
+                    _ = stream.write_all(response.as_bytes());
+                    _ = stream.write_all(b"\n");
                 }
-                continue;
+                Err(err) => error!("waiting for state query response: {err}"),
             }
+            return Ok(());
+        }
 
-            if is_subscribe_request(&argv_ref) {
-                match stream.try_clone() {
-                    Ok(clone) => {
-                        if let Err(err) = clone.set_nonblocking(true) {
-                            error!("configuring state subscriber as nonblocking: {err}");
-                            continue;
-                        }
-                        _ = self
-                            .events
-                            .send(Event::StateSubscribe {
-                                stream: Arc::new(Mutex::new(clone)),
-                            })
-                            .inspect_err(|err| {
-                                error!("registering state subscriber: {err}");
-                            });
+        if is_subscribe_request(&argv_ref) {
+            match stream.try_clone() {
+                Ok(clone) => {
+                    if let Err(err) = clone.set_nonblocking(true) {
+                        error!("configuring state subscriber as nonblocking: {err}");
+                        return Ok(());
                     }
-                    Err(err) => error!("cloning subscriber stream: {err}"),
+                    _ = self
+                        .events
+                        .send(Event::StateSubscribe {
+                            stream: Arc::new(Mutex::new(clone)),
+                        })
+                        .inspect_err(|err| {
+                            error!("registering state subscriber: {err}");
+                        });
                 }
-                continue;
+                Err(err) => error!("cloning subscriber stream: {err}"),
             }
+            return Ok(());
+        }
 
-            if let Ok(command) =
-                parse_command(&argv_ref).inspect_err(|err| error!("parsing command: {err}"))
+        if argv_ref.first() == Some(&"exec-cmd") {
+            let response = match parse_command(&argv_ref[1..])
+                .and_then(|command| self.events.send(Event::Command { command }))
             {
-                _ = self
-                    .events
-                    .send(Event::Command { command })
-                    .inspect_err(|err| {
-                        error!("sending command: {err}");
-                    });
-            }
+                Ok(()) => CommandResponse {
+                    ok: true,
+                    error: None,
+                },
+                Err(err) => CommandResponse {
+                    ok: false,
+                    error: Some(err.to_string()),
+                },
+            };
+            let response = serde_json::to_string(&response)?;
+            stream.write_all(response.as_bytes())?;
+            stream.write_all(b"\n")?;
+            return Ok(());
+        }
+
+        if let Ok(command) = parse_command(&argv_ref).inspect_err(|err| error!("parsing command: {err}")) {
+            _ = self
+                .events
+                .send(Event::Command { command })
+                .inspect_err(|err| {
+                    error!("sending command: {err}");
+                });
         }
         Ok(())
     }
@@ -209,5 +266,79 @@ fn full_read(stream: &mut UnixStream, expected: usize, buffer: &mut [u8]) -> boo
     } else {
         error!("short read, expected {expected}.");
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::{Command, Direction, Operation};
+    use std::sync::mpsc::TryRecvError;
+
+    fn send_request(stream: &mut UnixStream, params: &[&str]) {
+        let output = params
+            .iter()
+            .flat_map(|param| [param.as_bytes(), &[0]].concat())
+            .collect::<Vec<_>>();
+        let size: u32 = output.len().try_into().unwrap();
+        stream.write_all(&size.to_le_bytes()).unwrap();
+        stream.write_all(&output).unwrap();
+    }
+
+    #[test]
+    fn execute_command_queues_setwidth_and_acknowledges() {
+        let (events, receiver) = EventSender::new();
+        let reader = CommandReader::new(events);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        send_request(&mut client, &["exec-cmd", "window", "setwidth", "0.5"]);
+
+        reader.handle_connection(server).unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "{\"ok\":true}\n");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Command {
+                command: Command::Window(Operation::SetWidth(ratio))
+            }) if (ratio - 0.5).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn execute_command_rejects_invalid_operation_without_queueing() {
+        let (events, receiver) = EventSender::new();
+        let reader = CommandReader::new(events);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        send_request(&mut client, &["exec-cmd", "window", "invalid"]);
+
+        reader.handle_connection(server).unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let response: CommandResponse = serde_json::from_str(response.trim()).unwrap();
+        assert!(!response.ok);
+        assert!(response.error.is_some());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn legacy_command_queues_without_response() {
+        let (events, receiver) = EventSender::new();
+        let reader = CommandReader::new(events);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        send_request(&mut client, &["window", "focus", "east"]);
+
+        reader.handle_connection(server).unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Command {
+                command: Command::Window(Operation::Focus(Direction::East))
+            })
+        ));
     }
 }
