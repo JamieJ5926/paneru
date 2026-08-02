@@ -523,6 +523,10 @@ impl Config {
         i32::from(self.options().sliver_width.unwrap_or(5)).max(1)
     }
 
+    pub fn inner_gap(&self) -> i32 {
+        i32::from(self.options().inner_gap.unwrap_or(0))
+    }
+
     pub fn edge_padding(&self) -> (i32, i32, i32, i32) {
         let config = self.inner();
         let o = &config.options;
@@ -1169,6 +1173,8 @@ pub struct MainOptions {
     /// Width of off-screen window slivers in pixels.
     /// Default: 5 pixels.
     pub sliver_width: Option<u16>,
+    /// Spacing in pixels between tiled columns and stacked windows.
+    pub inner_gap: Option<u16>,
     /// Legacy top-level padding (deprecated; use `[padding]`).
     pub padding_top: Option<u16>,
     pub padding_bottom: Option<u16>,
@@ -2105,6 +2111,23 @@ fn test_config_defaults() {
     assert_eq!(config.border_width(), 2.0);
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
+}
+
+#[test]
+fn test_inner_gap_defaults_parses_and_enforces_u16() {
+    let config = Config::try_from("[options]\n\n[bindings]\n")
+        .expect("config without an inner gap should parse");
+    assert_eq!(config.inner_gap(), 0);
+
+    let config = Config::try_from("[options]\ninner_gap = 8\n\n[bindings]\n")
+        .expect("inner gap should parse");
+    assert_eq!(config.inner_gap(), 8);
+
+    let config = Config::try_from("[options]\ninner_gap = 65535\n\n[bindings]\n")
+        .expect("u16 maximum inner gap should parse");
+    assert_eq!(config.inner_gap(), 65_535);
+
+    assert!(Config::try_from("[options]\ninner_gap = 65536\n\n[bindings]\n").is_err());
 }
 
 #[test]

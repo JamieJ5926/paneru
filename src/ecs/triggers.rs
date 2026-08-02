@@ -1,3 +1,4 @@
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
@@ -9,6 +10,7 @@ use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
+use std::path::Path;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -1189,6 +1191,7 @@ pub(super) fn refresh_configuration_trigger(
     windows: Windows,
     mut displays: Query<&mut Display>,
     applications: Query<&Application>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::ConfigRefresh(event) = event else {
@@ -1234,9 +1237,11 @@ pub(super) fn refresh_configuration_trigger(
                 }
             }
             info!("Reloading configuration file; {}", path.display());
-            _ = config.reload_config(path.as_path()).inspect_err(|err| {
+            if let Err(err) =
+                reload_configuration_and_mark_layout_strips(&mut config, path, &mut commands)
+            {
                 error!("loading config '{}': {err}", path.display());
-            });
+            }
         }
 
         let height = config.menubar_height();
@@ -1253,6 +1258,27 @@ pub(super) fn refresh_configuration_trigger(
             update_passthrough(window, app, &config);
         }
     }
+}
+
+fn reload_configuration_and_mark_layout_strips(
+    config: &mut Config,
+    path: &Path,
+    commands: &mut Commands,
+) -> crate::errors::Result<bool> {
+    let old_inner_gap = config.inner_gap();
+    config.reload_config(path)?;
+
+    if config.inner_gap() == old_inner_gap {
+        return Ok(false);
+    }
+
+    commands.queue(|world: &mut bevy::ecs::world::World| {
+        let mut layout_strips = world.query::<&mut LayoutStrip>();
+        for mut layout_strip in layout_strips.iter_mut(world) {
+            layout_strip.set_changed();
+        }
+    });
+    Ok(true)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1384,5 +1410,83 @@ where
         Ordering::Greater
     } else {
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::change_detection::DetectChanges;
+    use bevy::ecs::system::SystemState;
+    use bevy::prelude::World;
+    use std::path::PathBuf;
+
+    type ReloadState<'w, 's> = SystemState<(
+        ResMut<'w, Config>,
+        Commands<'w, 's>,
+    )>;
+
+    #[test]
+    fn inner_gap_reload_marks_layout_strips_only_after_successful_change() {
+        let path = temporary_config_path();
+        std::fs::write(&path, "[options]\n\n[bindings]\n").expect("initial config should write");
+
+        let mut world = World::new();
+        world.insert_resource(Config::new(&path).expect("initial config should parse"));
+        let strip = world.spawn(LayoutStrip::default()).id();
+        world.clear_trackers();
+
+        std::fs::write(&path, "[options]\ninner_gap = 8\n\n[bindings]\n")
+            .expect("updated config should write");
+        let mut reload_state: ReloadState<'_, '_> = SystemState::new(&mut world);
+        {
+            let (mut config, mut commands) = reload_state.get_mut(&mut world);
+            assert!(
+                reload_configuration_and_mark_layout_strips(&mut config, &path, &mut commands)
+                    .expect("updated config should reload")
+            );
+        }
+        reload_state.apply(&mut world);
+
+        assert_eq!(world.resource::<Config>().inner_gap(), 8);
+        assert!(
+            world
+                .get_mut::<LayoutStrip>(strip)
+                .expect("layout strip should exist")
+                .is_changed()
+        );
+
+        world.clear_trackers();
+        std::fs::write(&path, "[options]\ninner_gap = 65536\n\n[bindings]\n")
+            .expect("invalid config should write");
+        {
+            let (mut config, mut commands) = reload_state.get_mut(&mut world);
+            assert!(
+                reload_configuration_and_mark_layout_strips(&mut config, &path, &mut commands)
+                    .is_err()
+            );
+        }
+        reload_state.apply(&mut world);
+
+        assert_eq!(world.resource::<Config>().inner_gap(), 8);
+        assert!(
+            !world
+                .get_mut::<LayoutStrip>(strip)
+                .expect("layout strip should exist")
+                .is_changed()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn temporary_config_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "paneru-inner-gap-reload-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ))
     }
 }
