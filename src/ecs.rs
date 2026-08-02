@@ -80,11 +80,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          mut focus_lost: RemovedComponents<FocusedMarker>,
-         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>| {
+         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>,
+         drag_reorder: Res<mouse::DragReorderState>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || focus_lost.read().next().is_some()
                 || !focused_moved.is_empty()
+                || drag_reorder.is_changed()
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());

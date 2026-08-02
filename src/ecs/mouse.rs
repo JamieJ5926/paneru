@@ -5,6 +5,7 @@ use bevy::ecs::query::With;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Query, Res, ResMut, Single};
+use bevy::math::IRect;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
@@ -41,7 +42,11 @@ impl Plugin for MouseEventsPlugin {
                 (
                     mouse_moved_trigger,
                     mouse_resize_trigger,
-                    (mouse_down_trigger, drag_reorder_trigger).chain(),
+                    (
+                        mouse_down_trigger,
+                        drag_reorder_trigger.after(super::systems::window_moved_update_frame),
+                    )
+                        .chain(),
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger
@@ -206,6 +211,7 @@ fn mouse_down_trigger(
         // managed window.
         drag_reorder.down = None;
         drag_reorder.dragging = None;
+        drag_reorder.target = None;
 
         let Some((_, entity)) = window_manager
             .find_window_at_point(point)
@@ -250,9 +256,10 @@ fn mouse_down_trigger(
 }
 
 #[derive(Default, Resource)]
-struct DragReorderState {
+pub(super) struct DragReorderState {
     down: Option<(Origin, Entity)>,
-    dragging: Option<(Entity, usize)>,
+    pub(super) dragging: Option<(Entity, usize)>,
+    pub(super) target: Option<usize>,
 }
 
 /// Arms a tiled-column reorder after the pointer has moved far enough from a
@@ -261,7 +268,8 @@ struct DragReorderState {
 #[allow(clippy::needless_pass_by_value)]
 fn drag_reorder_trigger(
     mut messages: MessageReader<Event>,
-    active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    windows: Windows,
+    active_workspace: Query<(&LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
     config: Res<Config>,
     mut state: ResMut<DragReorderState>,
 ) {
@@ -282,31 +290,63 @@ fn drag_reorder_trigger(
             // column after the modifier has been released.
             state.down = None;
             state.dragging = None;
+            state.target = None;
             continue;
         }
 
-        if state.dragging.is_some() {
-            continue;
-        }
         let Some((start, entity)) = state.down else {
             continue;
         };
-        let point = origin_from(*point);
-        let dx = i64::from(point.x) - i64::from(start.x);
-        let dy = i64::from(point.y) - i64::from(start.y);
-        if dx * dx + dy * dy <= 100 {
-            continue;
+
+        if state.dragging.is_none() {
+            let point = origin_from(*point);
+            let dx = i64::from(point.x) - i64::from(start.x);
+            let dy = i64::from(point.y) - i64::from(start.y);
+            if dx * dx + dy * dy <= 100 {
+                continue;
+            }
+
+            let Some((strip, _)) = active_workspace
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+            else {
+                state.down = None;
+                state.target = None;
+                continue;
+            };
+            let Ok(index) = strip.index_of(entity) else {
+                state.down = None;
+                state.target = None;
+                continue;
+            };
+            state.dragging = Some((entity, index));
         }
 
-        let Some(strip) = active_workspace.iter().find(|strip| strip.contains(entity)) else {
-            state.down = None;
+        let Some((dragged, _)) = state.dragging else {
             continue;
         };
-        let Ok(index) = strip.index_of(entity) else {
+        let Some((strip, strip_position)) = active_workspace
+            .iter()
+            .find(|(strip, _)| strip.contains(dragged))
+        else {
             state.down = None;
+            state.dragging = None;
+            state.target = None;
             continue;
         };
-        state.dragging = Some((entity, index));
+        let Some(mut frame) = windows.frame(dragged) else {
+            state.target = None;
+            continue;
+        };
+        frame.min.x -= strip_position.0.x;
+        frame.max.x -= strip_position.0.x;
+        state.target = drop_target_index(
+            strip,
+            dragged,
+            frame,
+            config.inner_gap(),
+            |column_entity| windows.frame(column_entity),
+        );
     }
 }
 
@@ -329,6 +369,7 @@ fn mouse_up_trigger(
 
         let dragging = drag_reorder.dragging.take();
         drag_reorder.down = None;
+        drag_reorder.target = None;
         let has_held_marker = !mouse_held.is_empty();
         // A missing marker normally means its timeout fired. At the maximum
         // hidden ratio, however, mouse-down deliberately does not spawn one.
@@ -341,20 +382,17 @@ fn mouse_up_trigger(
                 && strip.index_of(entity).ok() == Some(original_index)
                 && let Some(frame) = windows.frame(entity)
             {
-                let frame_x = frame.min.x - strip_position.0.x;
-                let frame_center_x = frame.center().x - strip_position.0.x;
-                // Keep the source slot in the candidates so a drag that
-                // remains nearest to its original slot is a no-op.
-                let slots = strip
-                    .column_positions(config.inner_gap(), &|column_entity| {
-                        windows.frame(column_entity)
-                    })
-                    .enumerate()
-                    .map(|(index, (_, x))| (index, x))
-                    .collect::<Vec<_>>();
+                let mut frame = frame;
+                frame.min.x -= strip_position.0.x;
+                frame.max.x -= strip_position.0.x;
 
-                if let Some(target) = nearest_slot(&slots, frame_x, frame_center_x) {
-                    let target = target.min(strip.len().saturating_sub(1));
+                if let Some(target) = drop_target_index(
+                    &strip,
+                    entity,
+                    frame,
+                    config.inner_gap(),
+                    |column_entity| windows.frame(column_entity),
+                ) {
                     if target != original_index {
                         move_column(&mut strip, original_index, target);
                     }
@@ -376,6 +414,27 @@ fn mouse_up_trigger(
             }
         }
     }
+}
+
+pub(super) fn drop_target_index<W>(
+    strip: &LayoutStrip,
+    dragged: Entity,
+    window_frame: IRect,
+    inner_gap: i32,
+    get_window_frame: W,
+) -> Option<usize>
+where
+    W: Fn(Entity) -> Option<IRect>,
+{
+    strip.index_of(dragged).ok()?;
+    let slots = strip
+        .column_positions(inner_gap, &get_window_frame)
+        .enumerate()
+        .map(|(index, (_, x))| (index, x))
+        .collect::<Vec<_>>();
+    let target = nearest_slot(&slots, window_frame.min.x, window_frame.center().x)?;
+
+    Some(target.min(strip.len().saturating_sub(1)))
 }
 
 fn nearest_slot(slots: &[(usize, i32)], frame_x: i32, frame_center_x: i32) -> Option<usize> {
@@ -627,10 +686,15 @@ fn horizontal_warp_mouse_trigger(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::commands::Command;
+    use crate::config::{Config, MainOptions};
     use crate::ecs::DockPosition;
     use crate::manager::{Display, Origin};
+    use crate::platform::Modifiers;
+    use crate::tests::{TEST_MENUBAR_HEIGHT, TestHarness};
+    use bevy::ecs::world::World;
     use bevy::math::IRect;
+    use objc2_core_foundation::CGPoint;
 
     fn make_display() -> Display {
         // 1024x768 test display with a 20px menubar, mirrors the values in src/tests.rs.
@@ -707,5 +771,106 @@ mod tests {
         let slots = [(0, 0), (1, 400), (2, 800)];
 
         assert_eq!(nearest_slot(&slots, 600, 800), Some(2));
+    }
+
+    #[test]
+    fn drop_target_index_matches_mouse_up_slot_selection() {
+        let mut world = World::new();
+        let windows = [
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        ];
+        let mut strip = LayoutStrip::default();
+        for entity in windows {
+            strip.append(entity);
+        }
+
+        let moved_frame = IRect::new(600, 0, 1000, 1_000);
+        assert_eq!(
+            drop_target_index(&strip, windows[0], moved_frame, 0, |entity| {
+                windows.iter().position(|window| *window == entity).map(|index| {
+                    let left = i32::try_from(index).unwrap() * 400;
+                    IRect::new(left, 0, left + 400, 1_000)
+                })
+            }),
+            Some(2),
+            "the same left-edge distance and center tie-break as mouse-up choose slot C"
+        );
+    }
+
+    #[test]
+    fn drag_reorder_target_tracks_window_frame_and_clears_on_drop() {
+        fn mouse_point(origin: Origin) -> CGPoint {
+            CGPoint {
+                x: f64::from(origin.x),
+                y: f64::from(origin.y),
+            }
+        }
+
+        fn active_strip_x(world: &mut World) -> i32 {
+            let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+            strips.single(world).expect("one active strip").0.x
+        }
+
+        let config: Config = (
+            MainOptions {
+                animation_speed: Some(10_000.0),
+                focus_follows_mouse: Some(false),
+                window_hidden_ratio: Some(1.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(3)
+            .on_iteration(1, |world, state| {
+                assert_eq!(world.resource::<DragReorderState>().target, None);
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world) + 800, TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(3, |world, state| {
+                assert_eq!(world.resource::<DragReorderState>().target, Some(2));
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world), TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(5, |world, _state| {
+                assert_eq!(world.resource::<DragReorderState>().target, Some(0));
+            })
+            .on_iteration(6, |world, _state| {
+                assert_eq!(world.resource::<DragReorderState>().target, None);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                Event::MouseDown {
+                    point: mouse_point(Origin::new(100, 100)),
+                    modifiers: Modifiers::empty(),
+                },
+                Event::Command {
+                    command: Command::PrintState,
+                },
+                Event::MouseDragged {
+                    point: mouse_point(Origin::new(800, 100)),
+                    modifiers: Modifiers::empty(),
+                },
+                Event::Command {
+                    command: Command::PrintState,
+                },
+                Event::MouseDragged {
+                    point: mouse_point(Origin::new(0, 100)),
+                    modifiers: Modifiers::empty(),
+                },
+                Event::MouseUp {
+                    point: mouse_point(Origin::new(0, 100)),
+                    modifiers: Modifiers::empty(),
+                },
+            ]);
     }
 }

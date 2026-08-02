@@ -20,7 +20,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition, mouse::DragReorderState,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -873,11 +873,16 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
+fn highlight_target(strip: &LayoutStrip, target: usize) -> Option<Entity> {
+    strip.get(target).ok().and_then(|column| column.top())
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition (strip change *or*
-    // focus change); this query just resolves the current active workspace.
+    // Gating lives in the `overlay_dirty` run condition (strip, focus, or
+    // drag-target change); this query just resolves the current active workspace.
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
+    drag_reorder: Res<DragReorderState>,
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
@@ -911,11 +916,17 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // Find the focused managed window's absolute CG frame.
+    // A drag highlights its destination column instead of the focused window.
     // Skip floating/unmanaged windows — no overlay or border for those.
-    let (focused_abs_cg, focused_window_id) = if let Some((window, _, unmanaged)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
+    let highlighted_entity = if drag_reorder.dragging.is_some() {
+        drag_reorder
+            .target
+            .and_then(|target| highlight_target(active_strip, target))
+    } else {
+        windows.focused().map(|(_, entity)| entity)
+    };
+    let (focused_abs_cg, focused_window_id) = if let Some((window, _, unmanaged)) =
+        highlighted_entity.and_then(|entity| windows.get_managed(entity))
         && unmanaged.is_none()
         && !window.is_full_screen()
     {
@@ -1262,5 +1273,28 @@ pub(crate) fn detect_tabbed_windows(
                 commands.focus_entity(entity, false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::world::World;
+
+    #[test]
+    fn highlight_target_uses_the_target_columns_top_window() {
+        let mut world = World::new();
+        let first = world.spawn_empty().id();
+        let stacked = world.spawn_empty().id();
+        let last = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(first);
+        strip.append(stacked);
+        strip.append(last);
+        strip.stack(stacked).expect("stack the second window");
+
+        assert_eq!(highlight_target(&strip, 0), Some(first));
+        assert_eq!(highlight_target(&strip, 1), Some(last));
+        assert_eq!(highlight_target(&strip, 2), None);
     }
 }
