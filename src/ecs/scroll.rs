@@ -61,6 +61,11 @@ fn swipe_gesture(
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    // Canvas displays: scroll gestures belong to the Canvas engine (see
+    // canvas_scroll_gesture). Leave the strip machinery untouched.
+    if config.is_canvas_display(active_display.display().uuid()) {
+        return;
+    }
     let swipe_sensitivity = config.swipe_sensitivity();
     let direction_modifier = match config.swipe_gesture_direction() {
         SwipeGestureDirection::Natural => -1.0,

@@ -149,6 +149,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 canvas::canvas_apply_frames
                     .run_if(not(resource_exists::<Initializing>)),
                 canvas::canvas_momentum_tick,
+                canvas::canvas_scroll_gesture,
                 canvas::canvas_cleanup_removed,
             )
                 .chain(),

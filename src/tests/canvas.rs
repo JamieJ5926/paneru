@@ -419,3 +419,85 @@ fn test_canvas_parse_command_forms() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+#[test]
+fn test_canvas_scroll_gesture_pans_camera() {
+    let mut harness = TestHarness::new()
+        .with_config(canvas_config(&[TEST_DISPLAY_ID]))
+        .with_windows(1);
+    harness.run(vec![
+        tick(),
+        Event::Scroll {
+            delta: 100.0,
+            continuous: true,
+        },
+    ]);
+    let world = harness.world();
+    let world_state = canvas_world(world, TEST_DISPLAY_ID).expect("canvas world exists");
+    // Trackpad scale 0.15: 100 * 0.15 = 15 px of camera pan (no fling yet).
+    assert_eq!(world_state.camera.x, 15.0);
+    assert_eq!(world_state.camera.y, 0.0);
+    assert!(!world_state.momentum.is_moving());
+}
+
+#[test]
+fn test_canvas_scroll_gesture_fling_on_release() {
+    let mut harness = TestHarness::new()
+        .with_config(canvas_config(&[TEST_DISPLAY_ID]))
+        .with_windows(1);
+    harness.run(vec![
+        tick(),
+        Event::Scroll {
+            delta: 100.0,
+            continuous: true,
+        },
+        Event::TouchpadUp,
+        Event::TouchpadUp,
+    ]);
+    let world = harness.world();
+    let world_state = canvas_world(world, TEST_DISPLAY_ID).expect("canvas world exists");
+    // The fling carries the camera beyond the 15px direct pan...
+    assert!(world_state.camera.x > 15.0);
+    // ...and eventually settles (momentum decays to the stop threshold).
+    for _ in 0..200 {
+        harness.app.update();
+    }
+    let world = harness.world();
+    let world_state = canvas_world(world, TEST_DISPLAY_ID).expect("canvas world exists");
+    assert!(!world_state.momentum.is_moving());
+}
+
+#[test]
+fn test_canvas_scroll_gesture_ignores_non_canvas_displays() {
+    // No canvas config: the gesture system must not create worlds or panic;
+    // the strip scroll path is exercised by the existing scroll tests.
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.run(vec![
+        tick(),
+        Event::Scroll {
+            delta: 100.0,
+            continuous: true,
+        },
+        Event::TouchpadUp,
+    ]);
+    let world = harness.world();
+    assert!(canvas_world(world, TEST_DISPLAY_ID).is_none());
+}
+
+#[test]
+fn test_canvas_scroll_gesture_wheel_tick() {
+    let mut harness = TestHarness::new()
+        .with_config(canvas_config(&[TEST_DISPLAY_ID]))
+        .with_windows(1);
+    harness.run(vec![
+        tick(),
+        Event::Scroll {
+            delta: 1.0,
+            continuous: false,
+        },
+    ]);
+    let world = harness.world();
+    let world_state = canvas_world(world, TEST_DISPLAY_ID).expect("canvas world exists");
+    // Physical wheel: one notch pans a fixed 60px.
+    assert_eq!(world_state.camera.x, 60.0);
+}

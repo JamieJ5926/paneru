@@ -20,9 +20,10 @@ use std::collections::{BTreeMap, HashMap};
 use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, With};
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use tracing::{debug, info, warn};
@@ -36,7 +37,8 @@ use crate::canvas_engine::momentum::MomentumState;
 use crate::canvas_engine::placement::grid_positions;
 use crate::canvas_engine::snap::{SnapRect, snap_candidates};
 use crate::config::Config;
-use crate::ecs::{CanvasManaged, Unmanaged};
+use crate::ecs::{ActiveDisplayMarker, CanvasManaged, Unmanaged};
+use crate::events::Event;
 use crate::manager::Display;
 use crate::platform::WinID;
 
@@ -533,4 +535,60 @@ pub fn canvas_auto_place(world: &mut CanvasWorld, viewport: Rect, margin: f64) {
         index += 1;
     }
     world.momentum.stop();
+}
+
+/// Canvas gesture routing: when the ACTIVE display is Canvas-managed,
+/// scroll/touchpad gestures pan the canvas camera (with momentum fling on
+/// release) instead of scrolling a strip. Non-canvas displays keep the
+/// existing smooth-wheel strip path untouched (`swipe_gesture` skips canvas
+/// displays). Registered outside the swipe chain to preserve the exact
+/// ScrollEventsPlugin schedule shape.
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn canvas_scroll_gesture(
+    mut messages: MessageReader<Event>,
+    mut worlds: ResMut<CanvasWorlds>,
+    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    config: Res<Config>,
+) {
+    if !config.is_canvas_display(active_display.uuid())
+        || config.excludes_display_uuid(active_display.uuid())
+    {
+        return;
+    }
+    let Some(world) = worlds.world_for_display_mut(active_display.uuid()) else {
+        return;
+    };
+    // Trackpad deltas are small fractions; scale to screen px (same order as
+    // the strip path's swipe_sensitivity normalization).
+    const TRACKPAD_SCALE: f64 = 0.15;
+    const WHEEL_STEP_PX: f64 = 60.0;
+    // Coarse event clock for velocity estimation; the tracker only needs
+    // relative spacing.
+    let mut now_ms = 0u32;
+    for event in messages.read() {
+        match event {
+            Event::Scroll {
+                delta,
+                continuous: true,
+            } => {
+                now_ms += 16;
+                let pan = Pt::new(*delta * TRACKPAD_SCALE, 0.0);
+                world.momentum.accumulate(pan, now_ms);
+                world.camera = world.camera.add(pan);
+            }
+            Event::Scroll {
+                delta,
+                continuous: false,
+            } => {
+                now_ms += 16;
+                let pan = Pt::new(delta.signum() * WHEEL_STEP_PX, 0.0);
+                world.momentum.accumulate(pan, now_ms);
+                world.camera = world.camera.add(pan);
+            }
+            Event::TouchpadUp => {
+                world.momentum.launch();
+            }
+            _ => {}
+        }
+    }
 }
