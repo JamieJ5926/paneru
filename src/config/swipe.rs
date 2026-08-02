@@ -50,4 +50,35 @@ pub struct ScrollOptions {
     /// switches virtual workspaces vertically instead of scrolling horizontally.
     #[serde(default, deserialize_with = "deserialize_modifier")]
     pub vertical_modifier: Option<Modifiers>,
+
+    /// Mos-style smoothing for discrete physical scroll-wheel ticks.
+    /// Continuous trackpad/Magic Mouse events are unaffected.
+    pub smoothing: Option<SmoothScrollOptions>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct SmoothScrollOptions {
+    /// Master switch for smoothing discrete physical scroll-wheel ticks.
+    /// When false, discrete wheel deltas move the strip immediately (Paneru's
+    /// pre-smoothing behavior). Continuous trackpad/Magic Mouse events are
+    /// never smoothed. Default: true.
+    pub enabled: Option<bool>,
+
+    /// Minimum normalized tick distance; small physical notches are raised to
+    /// this value so a single notch always moves the strip. Range: 0.01-100.0.
+    /// Default: 33.6.
+    pub step: Option<f64>,
+
+    /// Multiplier applied to each normalized tick before swipe.sensitivity.
+    /// Range: 1.0-10.0. Default: 2.7.
+    pub speed: Option<f64>,
+
+    /// Time (ms) for interpolation to cover 95% of the remaining distance.
+    /// Also sets the fling decay rate after tracking ends. Range: 50-2000.
+    /// Default: 560.
+    pub duration_ms: Option<u64>,
+
+    /// Fling lands (and stops) when the projected remaining distance is at or
+    /// below this many pixels. Range: 0.1-20.0. Default: 1.0.
+    pub dead_zone: Option<f64>,
 }

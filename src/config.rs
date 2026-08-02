@@ -274,6 +274,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
+        "scroll" => Operation::Scroll(parse_direction(argv.get(1).ok_or(err)?)?),
         "virtual" => {
             let target = argv.get(1).ok_or(err)?;
             target.parse::<u32>().map_or_else(
@@ -780,6 +781,66 @@ impl Config {
             .as_ref()
             .and_then(|swipe| swipe.scroll.as_ref())
             .and_then(|scroll| scroll.vertical_modifier)
+    }
+
+    pub fn smooth_scroll_enabled(&self) -> bool {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.smoothing.as_ref())
+            .and_then(|smoothing| smoothing.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn smooth_scroll_step(&self) -> f64 {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.smoothing.as_ref())
+            .and_then(|smoothing| smoothing.step)
+            .unwrap_or(33.6)
+            .clamp(0.01, 100.0)
+    }
+
+    pub fn smooth_scroll_speed(&self) -> f64 {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.smoothing.as_ref())
+            .and_then(|smoothing| smoothing.speed)
+            .unwrap_or(2.7)
+            .clamp(1.0, 10.0)
+    }
+
+    pub fn smooth_scroll_duration(&self) -> Duration {
+        Duration::from_millis(
+            self.inner()
+                .swipe
+                .as_ref()
+                .and_then(|swipe| swipe.scroll.as_ref())
+                .and_then(|scroll| scroll.smoothing.as_ref())
+                .and_then(|smoothing| smoothing.duration_ms)
+                .unwrap_or(560)
+                .clamp(50, 2000),
+        )
+    }
+
+    pub fn smooth_scroll_dead_zone(&self) -> f64 {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.smoothing.as_ref())
+            .and_then(|smoothing| smoothing.dead_zone)
+            .unwrap_or(1.0)
+            .clamp(0.1, 20.0)
     }
 
     pub fn window_dim_ratio(&self, is_dark: bool) -> Option<f32> {
@@ -1896,6 +1957,18 @@ fn test_parse_resize_commands() {
 }
 
 #[test]
+fn test_parse_scroll_commands() {
+    assert!(matches!(
+        parse_command(&["window", "scroll", "west"]).unwrap(),
+        Command::Window(Operation::Scroll(crate::commands::Direction::West))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "scroll", "east"]).unwrap(),
+        Command::Window(Operation::Scroll(crate::commands::Direction::East))
+    ));
+}
+
+#[test]
 fn test_parse_restart_command() {
     assert!(matches!(
         parse_command(&["restart"]).unwrap(),
@@ -2032,6 +2105,54 @@ fn test_config_defaults() {
     assert_eq!(config.border_width(), 2.0);
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_smooth_scroll_defaults() {
+    let config = Config::default();
+    assert!(config.smooth_scroll_enabled());
+    assert_eq!(config.smooth_scroll_step(), 33.6);
+    assert_eq!(config.smooth_scroll_speed(), 2.7);
+    assert_eq!(config.smooth_scroll_duration(), Duration::from_millis(560));
+    assert_eq!(config.smooth_scroll_dead_zone(), 1.0);
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_smooth_scroll_parsing() {
+    let config = Config::try_from(
+        "[options]\n[bindings]\n[swipe.scroll.smoothing]\nenabled = true\nstep = 33.6\nspeed = 2.7\nduration_ms = 560\ndead_zone = 1.0\n",
+    )
+    .expect("config should parse");
+    assert!(config.smooth_scroll_enabled());
+    assert_eq!(config.smooth_scroll_step(), 33.6);
+    assert_eq!(config.smooth_scroll_speed(), 2.7);
+    assert_eq!(config.smooth_scroll_duration(), Duration::from_millis(560));
+    assert_eq!(config.smooth_scroll_dead_zone(), 1.0);
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_smooth_scroll_clamps() {
+    let config = Config::try_from(
+        "[options]\n[bindings]\n[swipe.scroll.smoothing]\nenabled = false\nstep = 500.0\nspeed = 0.1\nduration_ms = 10\ndead_zone = 100.0\n",
+    )
+    .expect("config should parse");
+    assert!(!config.smooth_scroll_enabled());
+    assert_eq!(config.smooth_scroll_step(), 100.0);
+    assert_eq!(config.smooth_scroll_speed(), 1.0);
+    assert_eq!(config.smooth_scroll_duration(), Duration::from_millis(50));
+    assert_eq!(config.smooth_scroll_dead_zone(), 20.0);
+
+    let config = Config::try_from(
+        "[options]\n[bindings]\n[swipe.scroll.smoothing]\nstep = 0.001\nspeed = 0.5\nduration_ms = 5\ndead_zone = 0.01\n",
+    )
+    .expect("config should parse");
+    assert_eq!(config.smooth_scroll_step(), 0.01);
+    assert_eq!(config.smooth_scroll_speed(), 1.0);
+    assert_eq!(config.smooth_scroll_duration(), Duration::from_millis(50));
+    assert_eq!(config.smooth_scroll_dead_zone(), 0.1);
 }
 
 #[test]

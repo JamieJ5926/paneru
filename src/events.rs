@@ -94,8 +94,10 @@ pub enum Event {
     /// A single scroll wheel tick for vertical workspace switching (fires immediately).
     VerticalScrollTick { delta: f64 },
 
-    /// A mouse scroll has been detected.
-    Scroll { delta: f64 },
+    /// A scroll event (mouse wheel, trackpad, or Magic Mouse).
+    /// `continuous` is true for trackpad/Magic Mouse scrolls and momentum
+    /// phases; physical scroll-wheel notches report false.
+    Scroll { delta: f64, continuous: bool },
 
     /// Fingers have been placed on the touchpad.
     TouchpadDown,

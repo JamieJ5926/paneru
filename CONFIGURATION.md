@@ -93,6 +93,19 @@ When `fingers_count` is omitted or set below 3, Paneru does not intercept native
 | `modifier` | String | `"alt"` | Modifier key(s) required to slide windows with the scroll wheel: `"alt"`, `"rcmd"`, `"ralt + cmd"`, `"lctrl + lalt + cmd"`, etc. |
 | `vertical_modifier` | String | *None* | Additional modifier key that, when held together with `modifier`, switches virtual workspaces vertically instead of scrolling horizontally. For example, if `modifier = "alt"` and `vertical_modifier = "shift"`, then `alt + scroll` slides windows horizontally and `alt + shift + scroll` switches virtual workspace rows. |
 
+### `[swipe.scroll.smoothing]`
+Smooths discrete physical scroll-wheel ticks (Mos-style interpolation with an exponential fling). Continuous trackpad and Magic Mouse events are never smoothed and always use the native path.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Boolean | `true` | Master switch. When `false`, discrete wheel ticks move the strip immediately (pre-smoothing behavior). |
+| `step` | Float (0.01-100.0) | `33.6` | Minimum normalized tick distance; small physical notches are raised to this value so every notch moves the strip. |
+| `speed` | Float (1.0-10.0) | `2.7` | Multiplier applied to each normalized tick, before `sensitivity`. |
+| `duration_ms` | Integer (50-2000) | `560` | Time for the interpolation to cover 95% of the remaining distance; also sets the fling decay rate after tracking ends. |
+| `dead_zone` | Float (0.1-20.0) | `1.0` | The fling lands and stops once the projected remaining distance is at or below this many pixels. |
+
+`swipe.sensitivity` multiplies both gesture and wheel distance. `swipe.deceleration` affects trackpad inertia only; the wheel fling decays with `duration_ms`. These options apply to physical scroll wheels only.
+
 ---
 
 ## 4. Decorations (`[decorations]`)
@@ -174,6 +187,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
 | `window_snap` | Snap an overflowing window into the viewport. |
+| `window_scroll_west` / `_east` | Slide the strip one smooth wheel notch toward that side (same smoothing/fling as a physical wheel tick). |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `quit` | Exit Paneru. |

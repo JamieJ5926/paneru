@@ -113,6 +113,10 @@ pub enum Operation {
     /// Flips `FloatingLayer`, raises the other windows in the new top tier,
     /// and focuses the tier's last-focused window.
     ToggleFloatingLayer,
+    /// Slides the active strip one smooth scroll-wheel notch toward the
+    /// `Direction` (West = content moves left with the natural setting).
+    /// Uses the same smoothing/fling machinery as a physical wheel tick.
+    Scroll(Direction),
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -160,6 +164,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_toggle_floating_layer,
             command_swap_focus,
             snap_window,
+            scroll_strip,
         ),
     );
 }
@@ -1238,6 +1243,32 @@ fn balance_strip(
     }
 
     commands.reshuffle_around(focused_entity);
+}
+
+/// Slides the active strip one smooth wheel notch toward the requested
+/// direction. Injects a discrete wheel tick so the smoothing/fling machinery
+/// applies exactly as if the user turned a physical wheel (including the
+/// disabled-smoothing fallback and the direction modifier).
+#[allow(clippy::needless_pass_by_value)]
+fn scroll_strip(mut messages: MessageReader<Event>, mut commands: Commands) {
+    for operation in filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::Scroll(_))
+    }) {
+        let Operation::Scroll(direction) = operation else {
+            continue;
+        };
+        // Wheel-delta sign convention: positive moves content west under the
+        // natural setting; the direction modifier is applied downstream.
+        let delta = match direction {
+            Direction::West => 1.0,
+            Direction::East => -1.0,
+            _ => continue,
+        };
+        commands.trigger(SendMessageTrigger(Event::Scroll {
+            delta,
+            continuous: false,
+        }));
+    }
 }
 
 /// Slides the strip so the focused window is fully visible, snapping to the

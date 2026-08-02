@@ -62,11 +62,21 @@ fn swipe_gesture(
     mut commands: Commands,
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
+    let direction_modifier = match config.swipe_gesture_direction() {
+        SwipeGestureDirection::Natural => -1.0,
+        SwipeGestureDirection::Reversed => 1.0,
+    };
+    let smooth_enabled = config.smooth_scroll_enabled();
+    let wheel_rate = -0.05f64.ln() / config.smooth_scroll_duration().as_secs_f64();
+
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
     let mut has_scroll_event = false;
+    let mut has_direct_scroll = false;
     let mut has_gesture_event = false;
+    // Wheel target for the deferred insert path (no Scrolling component yet).
+    let mut pending_wheel_target: Option<f64> = None;
 
     // Normalization: Touchpad deltas are typically small fractions.
     // Scroll wheel deltas can be larger. We scale it down slightly
@@ -77,15 +87,46 @@ fn swipe_gesture(
     let scroll_scale = SCROLL_SCALE_LOWER
         + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
 
+    let (entity, position, scrolling) = &mut *active_workspace;
+
     for event in messages.read() {
         match event {
             Event::TouchpadDown => {
                 touchpad_down = true;
                 total_delta = 0.0;
             }
-            Event::Scroll { delta } => {
+            Event::Scroll { delta, continuous: true } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
+                has_direct_scroll = true;
+            }
+            Event::Scroll { delta, continuous: false } if smooth_enabled => {
+                has_scroll_event = true;
+                let normalized = delta.signum() * delta.abs().max(config.smooth_scroll_step());
+                let distance = normalized
+                    * config.smooth_scroll_speed()
+                    * swipe_sensitivity
+                    * direction_modifier;
+                if let Some(scrolling) = scrolling.as_mut() {
+                    feed_wheel_tick(scrolling, distance, wheel_rate);
+                } else {
+                    let base = f64::from(position.0.x);
+                    pending_wheel_target = Some(match pending_wheel_target {
+                        Some(target)
+                            if distance == 0.0
+                                || (target - base).signum() == distance.signum() =>
+                        {
+                            target + distance
+                        }
+                        _ => base + distance,
+                    });
+                }
+            }
+            Event::Scroll { delta, continuous: false } => {
+                // Smoothing disabled: current immediate path, zero synthetic velocity.
+                total_delta += *delta * scroll_scale;
+                has_scroll_event = true;
+                has_direct_scroll = true;
             }
             Event::Swipe { delta, fingers }
                 if config
@@ -105,20 +146,18 @@ fn swipe_gesture(
         return;
     }
 
-    let (entity, position, scrolling) = &mut *active_workspace;
-
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = Instant::now();
+        // Discrete-wheel motion must not survive a touchpad gesture.
+        scrolling.wheel_target = None;
+        scrolling.wheel_velocity = 0.0;
+        scrolling.wheel_idle_seconds = 0.0;
     }
 
-    if has_scroll_event {
+    if has_direct_scroll || has_gesture_event {
         let viewport_width = f64::from(active_display.bounds().width());
-        let direction_modifier = match config.swipe_gesture_direction() {
-            SwipeGestureDirection::Natural => -1.0,
-            SwipeGestureDirection::Reversed => 1.0,
-        };
 
         let dt = time.delta_secs_f64();
         let new_velocity = if has_gesture_event && dt > 0.0 {
@@ -128,6 +167,10 @@ fn swipe_gesture(
         };
 
         if let Some(scrolling) = scrolling.as_mut() {
+            // Continuous events take the direct path; drop any wheel-only state.
+            scrolling.wheel_target = None;
+            scrolling.wheel_velocity = 0.0;
+            scrolling.wheel_idle_seconds = 0.0;
             // Native modifier-scroll events already include macOS momentum.
             // Add synthetic inertia only for raw multi-finger gestures.
             scrolling.velocity = if has_gesture_event {
@@ -147,8 +190,99 @@ fn swipe_gesture(
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
                 is_user_swiping: true,
                 last_event: Instant::now(),
+                wheel_target: pending_wheel_target,
+                ..Scrolling::default()
             });
         }
+    } else if let Some(target) = pending_wheel_target {
+        if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+            entity_commands.try_insert(Scrolling {
+                velocity: 0.0,
+                position: f64::from(position.0.x),
+                is_user_swiping: false,
+                last_event: Instant::now(),
+                wheel_target: Some(target),
+                ..Scrolling::default()
+            });
+        }
+    }
+}
+
+/// Feeds one discrete wheel tick into the wheel motion state (Mos observable
+/// contract): same-direction ticks extend the current target, a reversal
+/// discards the old residual tail, and a tick arriving during a fling
+/// continues from the projected resting position.
+fn feed_wheel_tick(scroll: &mut Scrolling, distance: f64, rate: f64) {
+    scroll.velocity = 0.0;
+    scroll.is_user_swiping = false;
+    scroll.last_event = Instant::now();
+    scroll.wheel_idle_seconds = 0.0;
+    let base = scroll.position;
+    let same_direction = |target: f64| {
+        distance == 0.0 || (target - base).signum() == distance.signum()
+    };
+    match scroll.wheel_target {
+        Some(target) if same_direction(target) => scroll.wheel_target = Some(target + distance),
+        Some(_) => {
+            // Reversal: discard the old residual tail and start fresh.
+            scroll.wheel_target = Some(base + distance);
+            scroll.wheel_velocity = 0.0;
+        }
+        None if scroll.wheel_velocity != 0.0 => {
+            // Tick during a fling: continue from the projected rest, or reset
+            // on reversal.
+            let projected = base + scroll.wheel_velocity / rate;
+            scroll.wheel_target = Some(if same_direction(projected) {
+                projected + distance
+            } else {
+                base + distance
+            });
+            scroll.wheel_velocity = 0.0;
+        }
+        None => scroll.wheel_target = Some(base + distance),
+    }
+}
+
+/// Advances discrete-wheel motion by one frame. While `wheel_target` is
+/// present the position interpolates toward it with rate `rate` (95% of the
+/// remaining distance per `duration_ms`); once `wheel_idle_seconds` exceeds
+/// the continuation threshold the target is dropped and the retained velocity
+/// decays as a closed-form exponential fling. When the projected remaining
+/// distance is at or below `dead_zone` the motion lands exactly on the
+/// projected endpoint and stops. `rate` and the targets are signed display
+/// pixels, so no direction modifier or viewport scaling is applied here.
+fn advance_wheel(scroll: &mut Scrolling, dt: f64, rate: f64, dead_zone: f64) {
+    const FLING_THRESHOLD_SECONDS: f64 = 0.18;
+    if dt <= 0.0 {
+        return;
+    }
+    if let Some(target) = scroll.wheel_target {
+        if scroll.wheel_idle_seconds < FLING_THRESHOLD_SECONDS {
+            scroll.wheel_idle_seconds += dt;
+            let remaining = target - scroll.position;
+            scroll.position = target - remaining * (-rate * dt).exp();
+            scroll.wheel_velocity = rate * (target - scroll.position);
+            if scroll.wheel_idle_seconds >= FLING_THRESHOLD_SECONDS {
+                // Tracking-to-fling transition: keep the derivative, drop the
+                // target. The fling is the continuous extension of the
+                // interpolation, so no transition jump occurs.
+                scroll.wheel_target = None;
+            }
+            return;
+        }
+        scroll.wheel_target = None;
+    }
+    if scroll.wheel_velocity == 0.0 {
+        return;
+    }
+    let decay = (-rate * dt).exp();
+    let projected_rest = scroll.wheel_velocity / rate;
+    if projected_rest.abs() <= dead_zone {
+        scroll.position += projected_rest;
+        scroll.wheel_velocity = 0.0;
+    } else {
+        scroll.position += scroll.wheel_velocity * (1.0 - decay) / rate;
+        scroll.wheel_velocity *= decay;
     }
 }
 
@@ -171,6 +305,8 @@ pub(super) fn swiping_timeout(
             scroll.is_user_swiping = false;
 
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
+                && scroll.wheel_target.is_none()
+                && scroll.wheel_velocity == 0.0
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
                 entity_commands.try_remove::<Scrolling>();
@@ -193,7 +329,17 @@ fn apply_inertia(
     config: Res<Config>,
 ) {
     let dt = time.delta_secs_f64();
+    // Discrete-wheel motion advances here, after input handling and before the
+    // snap/integrator/constraint systems. This deliberately reuses the chain's
+    // existing schedule slot: registering a separate system between
+    // swipe_gesture and apply_inertia perturbs Bevy's scheduler order of the
+    // layout animation/reshape systems and changes gesture timing.
+    let wheel_rate = -0.05f64.ln() / config.smooth_scroll_duration().as_secs_f64();
+    let dead_zone = config.smooth_scroll_dead_zone();
     for (_, mut scroll) in &mut strips {
+        if scroll.wheel_target.is_some() || scroll.wheel_velocity != 0.0 {
+            advance_wheel(&mut scroll, dt, wheel_rate, dead_zone);
+        }
         if scroll.is_user_swiping {
             continue;
         }
@@ -229,6 +375,10 @@ fn apply_snap_force(
 
     let (strip, position, ref mut scroll) = *strip;
     if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 {
+        return;
+    }
+    // Auto-center may resume only after wheel motion has settled.
+    if scroll.wheel_target.is_some() || scroll.wheel_velocity != 0.0 {
         return;
     }
 
@@ -294,18 +444,74 @@ fn apply_scrolling_constraints(
     let (strip, ref mut position, ref mut scroll) = *strip;
 
     let get_window_frame = |entity| windows.moving_frame(entity);
-    if let Some(clamped_offset) = clamp_viewport_offset(
-        scroll.position as i32,
+    let raw_position = scroll.position as i32;
+    let clamped_offset = clamp_viewport_offset(
+        raw_position,
         strip,
         &windows,
         &get_window_frame,
         &viewport,
         &config,
-    ) {
+    );
+    if let Some(clamped_offset) = clamped_offset {
         position.x = clamped_offset;
-        scroll.position = f64::from(clamped_offset);
+        // While wheel motion is active, keep the continuous motion state
+        // unquantized so interpolation and the fling travel the full target
+        // distance; the layout offset remains i32. Re-sync once motion settles.
+        if scroll.wheel_target.is_none() && scroll.wheel_velocity == 0.0 {
+            scroll.position = f64::from(clamped_offset);
+        }
+        let clamp_offset = |offset| {
+            clamp_viewport_offset(
+                offset,
+                strip,
+                &windows,
+                &get_window_frame,
+                &viewport,
+                &config,
+            )
+        };
+        apply_wheel_constraints(scroll, raw_position, Some(clamped_offset), clamp_offset);
     } else {
         scroll.velocity = 0.0;
+        scroll.wheel_target = None;
+        scroll.wheel_velocity = 0.0;
+    }
+}
+
+/// Clamps wheel motion state against the strip boundaries: the wheel target
+/// is clamped through the same offset clamps as the position, outward wheel
+/// velocity is zeroed when the requested frame crosses a boundary, and a
+/// missing valid extent clears all wheel state (no unreachable target is
+/// retained).
+fn apply_wheel_constraints(
+    scroll: &mut Scrolling,
+    raw_position: i32,
+    clamped_position: Option<i32>,
+    clamp_offset: impl Fn(i32) -> Option<i32>,
+) {
+    match clamped_position {
+        Some(clamped) => {
+            let outward = f64::from(raw_position - clamped).signum();
+            if outward != 0.0 && outward == scroll.wheel_velocity.signum() {
+                scroll.wheel_velocity = 0.0;
+            }
+            if let Some(target) = scroll.wheel_target {
+                match clamp_offset(target as i32) {
+                    Some(clamped_target) => {
+                        scroll.wheel_target = Some(f64::from(clamped_target));
+                    }
+                    None => {
+                        scroll.wheel_target = None;
+                        scroll.wheel_velocity = 0.0;
+                    }
+                }
+            }
+        }
+        None => {
+            scroll.wheel_target = None;
+            scroll.wheel_velocity = 0.0;
+        }
     }
 }
 
@@ -431,4 +637,211 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
     commands.trigger(SendMessageTrigger(Event::Command {
         command: Command::Window(Operation::Virtual(direction)),
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: f64 = 5.348_715_445_543_852; // -ln(0.05) / 0.56 (default duration_ms = 560)
+    const DEAD_ZONE: f64 = 1.0;
+
+    fn wheel_scroll(position: f64, target: Option<f64>, velocity: f64, idle: f64) -> Scrolling {
+        Scrolling {
+            velocity: 0.0,
+            position,
+            is_user_swiping: false,
+            last_event: Instant::now(),
+            wheel_target: target,
+            wheel_velocity: velocity,
+            wheel_idle_seconds: idle,
+        }
+    }
+
+    #[test]
+    fn wheel_tick_moves_partway_on_first_frame() {
+        let mut scroll = wheel_scroll(0.0, Some(-100.0), 0.0, 0.0);
+        advance_wheel(&mut scroll, 1.0 / 60.0, RATE, DEAD_ZONE);
+        assert!(scroll.position < 0.0);
+        assert!(scroll.position > -100.0);
+        assert_ne!(scroll.position, -100.0);
+        assert_ne!(scroll.wheel_velocity, 0.0);
+    }
+
+    #[test]
+    fn wheel_same_direction_ticks_extend_target_and_travel() {
+        let mut burst = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut burst, -33.6, RATE);
+        feed_wheel_tick(&mut burst, -33.6, RATE);
+        feed_wheel_tick(&mut burst, -33.6, RATE);
+        assert!(
+            (burst.wheel_target.expect("target") + 100.8).abs() < 1e-9,
+            "three same-direction ticks must accumulate to -100.8"
+        );
+
+        let mut single = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut single, -33.6, RATE);
+        assert_eq!(single.wheel_target, Some(-33.6));
+
+        for _ in 0..5 {
+            advance_wheel(&mut burst, 1.0 / 60.0, RATE, DEAD_ZONE);
+            advance_wheel(&mut single, 1.0 / 60.0, RATE, DEAD_ZONE);
+        }
+        assert!(
+            burst.position < single.position,
+            "burst must travel farther than a single tick"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn wheel_reversed_tick_replaces_residual() {
+        let mut scroll = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut scroll, -33.6, RATE);
+        // Two 50ms frames keep tracking below the 0.18s fling threshold.
+        advance_wheel(&mut scroll, 0.05, RATE, DEAD_ZONE);
+        advance_wheel(&mut scroll, 0.05, RATE, DEAD_ZONE);
+        assert!(scroll.position < 0.0);
+
+        feed_wheel_tick(&mut scroll, 33.6, RATE);
+        assert_eq!(scroll.wheel_target, Some(scroll.position + 33.6));
+        assert_eq!(scroll.wheel_velocity, 0.0);
+
+        let before = scroll.position;
+        advance_wheel(&mut scroll, 0.05, RATE, DEAD_ZONE);
+        assert!(
+            scroll.position > before,
+            "next frame must move only in the new direction"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn wheel_reversed_tick_during_fling_resets() {
+        let mut scroll = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut scroll, -33.6, RATE);
+        // Three 100ms frames: idle 0.3s > 0.18s, so tracking already became a fling.
+        for _ in 0..3 {
+            advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        }
+        assert!(scroll.wheel_target.is_none());
+        assert_ne!(scroll.wheel_velocity, 0.0);
+
+        feed_wheel_tick(&mut scroll, 33.6, RATE);
+        assert_eq!(scroll.wheel_target, Some(scroll.position + 33.6));
+        assert_eq!(scroll.wheel_velocity, 0.0);
+
+        let before = scroll.position;
+        advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        assert!(scroll.position > before);
+    }
+
+    #[test]
+    fn wheel_tracking_to_fling_is_continuous() {
+        let mut scroll = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut scroll, -100.0, RATE);
+        advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        // Crossing frame: target cleared, velocity retained.
+        assert!(scroll.wheel_target.is_none());
+        let position = scroll.position;
+        let velocity = scroll.wheel_velocity;
+        assert!(
+            (position + velocity / RATE + 100.0).abs() < 1e-6,
+            "projected endpoint must equal the target"
+        );
+
+        for _ in 0..200 {
+            if scroll.wheel_velocity == 0.0 {
+                break;
+            }
+            advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        }
+        assert_eq!(scroll.wheel_velocity, 0.0);
+        assert!(
+            (scroll.position + 100.0).abs() < 1e-6,
+            "fling must land on the original target"
+        );
+    }
+
+    #[test]
+    fn wheel_frame_rate_independent() {
+        let mut at_60 = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut at_60, -100.0, RATE);
+        for _ in 0..60 {
+            advance_wheel(&mut at_60, 1.0 / 60.0, RATE, DEAD_ZONE);
+        }
+
+        let mut at_120 = wheel_scroll(0.0, None, 0.0, 0.0);
+        feed_wheel_tick(&mut at_120, -100.0, RATE);
+        for _ in 0..120 {
+            advance_wheel(&mut at_120, 1.0 / 120.0, RATE, DEAD_ZONE);
+        }
+
+        assert!(
+            (at_60.position - at_120.position).abs() < 1e-4,
+            "positions drift across refresh rates: {} vs {}",
+            at_60.position,
+            at_120.position
+        );
+        assert!(
+            (at_60.wheel_velocity - at_120.wheel_velocity).abs() < 1e-3,
+            "velocities drift across refresh rates"
+        );
+    }
+
+    #[test]
+    fn wheel_zero_dt_is_finite_and_stationary() {
+        let mut scroll = wheel_scroll(-10.0, Some(-100.0), -20.0, 0.1);
+        advance_wheel(&mut scroll, 0.0, RATE, DEAD_ZONE);
+        assert_eq!(scroll.position, -10.0);
+        assert_eq!(scroll.wheel_target, Some(-100.0));
+        assert_eq!(scroll.wheel_velocity, -20.0);
+        assert!(scroll.position.is_finite());
+        assert!(scroll.wheel_velocity.is_finite());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn wheel_fling_lands_exactly_at_dead_zone() {
+        // Projected rest 1.01 px > dead_zone 1.0: one decaying frame, then the
+        // motion lands exactly on the projected endpoint.
+        let mut scroll = wheel_scroll(0.0, None, RATE * 1.01, 0.0);
+        advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        let decay = (-RATE * 0.1).exp();
+        assert_ne!(scroll.wheel_velocity, 0.0);
+        let expected = 1.01 * (1.0 - decay);
+        assert!((scroll.position - expected).abs() < 1e-12);
+
+        let projected = scroll.wheel_velocity / RATE;
+        let before = scroll.position;
+        advance_wheel(&mut scroll, 0.1, RATE, DEAD_ZONE);
+        assert_eq!(scroll.wheel_velocity, 0.0);
+        assert!(
+            (scroll.position - (before + projected)).abs() < 1e-12,
+            "landing must advance exactly to the projected endpoint"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn wheel_clamped_edge_clears_outward_motion() {
+        // Raw position -10 clamped to 0: left boundary, outward (negative) motion killed.
+        let mut outward = wheel_scroll(-10.0, Some(-50.0), -5.0, 0.0);
+        apply_wheel_constraints(&mut outward, -10, Some(0), |_| Some(-20));
+        assert_eq!(outward.wheel_velocity, 0.0);
+        assert_eq!(outward.wheel_target, Some(-20.0));
+
+        // Inward (positive) velocity at the same boundary is preserved.
+        let mut inward = wheel_scroll(-10.0, Some(-50.0), 5.0, 0.0);
+        apply_wheel_constraints(&mut inward, -10, Some(0), |_| Some(-20));
+        assert_eq!(inward.wheel_velocity, 5.0);
+        assert_eq!(inward.wheel_target, Some(-20.0));
+
+        // No valid strip extent: all wheel state is cleared, no unreachable target.
+        let mut invalid = wheel_scroll(-10.0, Some(-50.0), -5.0, 0.0);
+        apply_wheel_constraints(&mut invalid, -10, None, |_| None);
+        assert_eq!(invalid.wheel_velocity, 0.0);
+        assert_eq!(invalid.wheel_target, None);
+    }
 }

@@ -239,6 +239,14 @@ pub struct Scrolling {
     pub is_user_swiping: bool,
     /// Last time a physical swipe event was received.
     pub last_event: Instant,
+    /// Some while interpolating toward accumulated discrete scroll-wheel input.
+    pub wheel_target: Option<f64>,
+    /// Current wheel motion in display pixels/second; non-zero after tracking
+    /// becomes a fling.
+    pub wheel_velocity: f64,
+    /// Seconds since the last discrete wheel tick; tracking turns into a fling
+    /// once this exceeds the continuation threshold.
+    pub wheel_idle_seconds: f64,
 }
 
 impl Default for Scrolling {
@@ -248,6 +256,9 @@ impl Default for Scrolling {
             position: 0.0,
             is_user_swiping: false,
             last_event: Instant::now(),
+            wheel_target: None,
+            wheel_velocity: 0.0,
+            wheel_idle_seconds: 0.0,
         }
     }
 }

@@ -19,19 +19,137 @@ use crate::{assert_focused, assert_window_at, assert_window_size};
 use super::*;
 
 #[test]
-fn modifier_scroll_uses_native_momentum_without_synthetic_velocity() {
+fn modifier_scroll_smoothing_interpolates_then_settles() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::Scroll { delta: 1.0 },
+        Event::Scroll {
+            delta: 1.0,
+            continuous: false,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            // One notch after 5 updates at 100ms: interpolation moved the strip
+            // partway (between 0 and the full -31.752 travel) and wheel motion
+            // is still active.
+            let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+            let scrolling = query.single(world).expect("wheel motion still active");
+            assert!(scrolling.position < 0.0 && scrolling.position > -31.752);
+            let mut windows = world.query::<&Window>();
+            let window = windows
+                .iter(world)
+                .find(|w| w.id() == 0)
+                .expect("window 0");
+            assert!(window.frame().min.x < 0 && window.frame().min.x > -32);
+        })
+        .on_iteration(2, |world, _state| {
+            // After 10 updates the fling has landed exactly on the target: the
+            // wheel state is settled (swiping_timeout removal is wall-clock
+            // gated and does not fire within the harness's fast updates).
+            assert_window_at!(world, 0, -31, TEST_MENUBAR_HEIGHT);
+            let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+            let scrolling = query.single(world).expect("scrolling component");
+            assert!(
+                scrolling.wheel_target.is_none() && scrolling.wheel_velocity == 0.0,
+                "wheel motion must settle"
+            );
+            assert_eq!(scrolling.velocity, 0.0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn modifier_scroll_command_smooths_like_wheel() {
+    // The `window scroll west` command must glide the strip like a physical
+    // wheel notch: partway after the first update batch, settled at the full
+    // travel afterwards.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Scroll(Direction::West)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
     ];
 
     TestHarness::new()
         .with_windows(3)
         .on_iteration(1, |world, _state| {
             let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
-            let scrolling = query.single(world).expect("active workspace is scrolling");
-            assert!(scrolling.velocity.abs() < 0.0001);
-            assert!(scrolling.is_user_swiping);
+            let scrolling = query.single(world).expect("smooth scroll still active");
+            assert!(scrolling.position < 0.0 && scrolling.position > -31.752);
+        })
+        .on_iteration(2, |world, _state| {
+            // Settled exactly on the target; the wheel state is done.
+            assert_window_at!(world, 0, -31, TEST_MENUBAR_HEIGHT);
+            let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+            let scrolling = query.single(world).expect("scrolling component");
+            assert!(
+                scrolling.wheel_target.is_none() && scrolling.wheel_velocity == 0.0,
+                "command-triggered wheel motion must settle"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn modifier_scroll_continuous_displaces_immediately_no_residual() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Scroll {
+            delta: 1.0,
+            continuous: true,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    // Direct displacement: 1.0 * scroll_scale(0.030375) * 1024 * -1 * 0.35
+    // = -10.886 px, applied in the event update; later updates show no
+    // residual wheel motion.
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_window_at!(world, 0, -10, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, -10, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn modifier_scroll_disabled_smoothing_displaces_immediately() {
+    let config = Config::try_from("[options]\n[bindings]\n[swipe.scroll.smoothing]\nenabled = false\n")
+        .expect("config should parse");
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Scroll {
+            delta: 1.0,
+            continuous: false,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    // Smoothing disabled: the entire immediate displacement occurs in the
+    // event update, exactly like the pre-smoothing behavior.
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_window_at!(world, 0, -10, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, -10, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -1825,3 +1943,4 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         "unstacking must bring the focused window fully back into view"
     );
 }
+

@@ -307,7 +307,22 @@ impl InputHandler {
             };
 
             if delta.abs() > 0.001 {
-                _ = events.send(Event::Scroll { delta });
+                let is_continuous = CGEvent::double_value_field(
+                    Some(event),
+                    CGEventField::ScrollWheelEventIsContinuous,
+                );
+                let scroll_phase = CGEvent::integer_value_field(
+                    Some(event),
+                    CGEventField::ScrollWheelEventScrollPhase,
+                );
+                let momentum_phase = CGEvent::integer_value_field(
+                    Some(event),
+                    CGEventField::ScrollWheelEventMomentumPhase,
+                );
+                let continuous =
+                    is_continuous_scroll_event(is_continuous, scroll_phase, momentum_phase);
+
+                _ = events.send(Event::Scroll { delta, continuous });
                 return true; // Intercept: don't let the window scroll
             }
         }
@@ -461,6 +476,13 @@ impl InputHandler {
     }
 }
 
+/// True for trackpad/Magic Mouse scrolls (isContinuous set) and any event
+/// with an active scroll or momentum phase; false for discrete physical
+/// wheel notches, which report all three as zero.
+fn is_continuous_scroll_event(is_continuous: f64, scroll_phase: i64, momentum_phase: i64) -> bool {
+    is_continuous != 0.0 || scroll_phase != 0 || momentum_phase != 0
+}
+
 fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: usize) -> bool {
     configured_fingers.is_some_and(|configured| {
         configured >= GESTURE_MINIMAL_FINGERS && configured == actual_fingers
@@ -608,5 +630,28 @@ mod tests {
         assert!(gesture_should_intercept(Some(3), 3));
         assert!(!gesture_should_intercept(Some(4), 3));
         assert!(gesture_should_intercept(Some(4), 4));
+    }
+
+    #[test]
+    fn scroll_event_classification_discrete_notch_is_not_continuous() {
+        assert!(!is_continuous_scroll_event(0.0, 0, 0));
+    }
+
+    #[test]
+    fn scroll_event_classification_is_continuous_field_is_continuous() {
+        assert!(is_continuous_scroll_event(1.0, 0, 0));
+        assert!(is_continuous_scroll_event(0.5, 0, 0));
+    }
+
+    #[test]
+    fn scroll_event_classification_active_scroll_phase_is_continuous() {
+        assert!(is_continuous_scroll_event(0.0, 1, 0));
+        assert!(is_continuous_scroll_event(0.0, 2, 0));
+    }
+
+    #[test]
+    fn scroll_event_classification_momentum_phase_is_continuous() {
+        assert!(is_continuous_scroll_event(0.0, 0, 1));
+        assert!(is_continuous_scroll_event(0.0, 0, 4));
     }
 }
