@@ -106,6 +106,36 @@ pub struct PaneruQueryState {
     pub timestamp: u64,
     pub active: PaneruActiveState,
     pub virtual_workspaces: Vec<PaneruVirtualWorkspaceState>,
+    /// Canvas-mode worlds (empty when Canvas mode is not configured).
+    /// Additive: existing consumers can ignore this key.
+    #[serde(default)]
+    pub canvas: Vec<PaneruCanvasWorldState>,
+}
+
+/// One Canvas world in `query state --json`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PaneruCanvasWorldState {
+    pub display_uuid: String,
+    /// Camera position (display-local screen px of the world origin).
+    pub camera: [f64; 2],
+    pub zoom: f64,
+    pub surfaces: Vec<PaneruCanvasSurfaceState>,
+}
+
+/// One Canvas surface in `query state --json`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PaneruCanvasSurfaceState {
+    pub window_id: WinID,
+    /// World-space rect `[x, y, w, h]` (display-local coords at zoom 1).
+    pub world_rect: [f64; 4],
+    /// Last native frame `[x, y, w, h]` requested by the apply pass.
+    pub requested_frame: Option<[i32; 4]>,
+    /// Last native frame `[x, y, w, h]` observed after an apply.
+    pub observed_frame: [i32; 4],
+    /// True when the observed native size differs from the requested one.
+    pub constrained: bool,
+    /// True when the window is minimized/hidden and the apply pass skips it.
+    pub suspended: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -434,6 +464,7 @@ impl PaneruQueryState {
         windows: &Windows,
         apps: &Query<&Application>,
         window_manager: &WindowManager,
+        canvas_worlds: &crate::ecs::canvas::CanvasWorlds,
     ) -> crate::errors::Result<Self> {
         let focused_entity = windows.focused().map(|(_, entity)| entity);
 
@@ -542,11 +573,47 @@ impl PaneruQueryState {
         virtual_workspaces
             .sort_by_key(|workspace| (workspace.native_workspace_id, workspace.number));
 
+        let mut canvas = canvas_worlds
+            .worlds
+            .iter()
+            .map(|(display_uuid, world)| PaneruCanvasWorldState {
+                display_uuid: display_uuid.clone(),
+                camera: [world.camera.x, world.camera.y],
+                zoom: world.zoom,
+                surfaces: world
+                    .surfaces
+                    .iter()
+                    .map(|(window_id, surface)| PaneruCanvasSurfaceState {
+                        window_id: *window_id,
+                        world_rect: [
+                            surface.world.x,
+                            surface.world.y,
+                            surface.world.w,
+                            surface.world.h,
+                        ],
+                        requested_frame: surface.last_requested.map(|frame| {
+                            [frame.min.x, frame.min.y, frame.width(), frame.height()]
+                        }),
+                        observed_frame: [
+                            surface.last_observed.min.x,
+                            surface.last_observed.min.y,
+                            surface.last_observed.width(),
+                            surface.last_observed.height(),
+                        ],
+                        constrained: surface.constrained,
+                        suspended: surface.suspended,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        canvas.sort_by(|a, b| a.display_uuid.cmp(&b.display_uuid));
+
         Ok(Self {
             version: 1,
             timestamp: now_timestamp(),
             active,
             virtual_workspaces,
+            canvas,
         })
     }
 

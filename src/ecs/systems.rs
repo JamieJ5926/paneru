@@ -28,9 +28,10 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, Bounds, BruteforceWindows, CanvasManaged, FlashMessage, FocusedMarker,
+    Initializing, LowPowerMode, MissionControlActive, Position, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -253,6 +254,33 @@ pub(crate) fn finish_setup(
             }
             debug!(
                 "space {}: excluded display, strip emptied {strip:?}",
+                strip.id()
+            );
+            continue;
+        }
+
+        // Canvas display: leave OS frames untouched and keep every window
+        // outside all strips — the Canvas engine owns frames from here on.
+        // Windows already carrying the CanvasManaged marker (routed on spawn)
+        // are left in place; the rest are converted so seeding sees the
+        // original OS frames.
+        let canvas = displays
+            .get(child.parent())
+            .is_ok_and(|display| config.is_canvas_display(display.uuid()));
+        if canvas {
+            for entity in strip.all_windows() {
+                strip.remove(entity);
+            }
+            if let Some(workspace_windows) = workspace_windows {
+                for (_, entity) in workspace_windows {
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert(Unmanaged::Floating);
+                        entity_commands.try_insert(CanvasManaged);
+                    }
+                }
+            }
+            debug!(
+                "space {}: canvas display, strip emptied {strip:?}",
                 strip.id()
             );
             continue;
@@ -1011,7 +1039,7 @@ pub(super) fn commit_window_size(
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<&mut Window>,
+    mut all_windows: Query<&mut Window, Without<CanvasManaged>>,
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,

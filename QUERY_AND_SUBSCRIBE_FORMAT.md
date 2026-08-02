@@ -62,9 +62,41 @@ Returns the complete state document.
         }
       ]
     }
+  ],
+  "canvas": [
+    {
+      "display_uuid": "9D591927-AB36-407B-A9E5-1F26E167974E",
+      "camera": [123.5, -40.0],
+      "zoom": 0.5,
+      "surfaces": [
+        {
+          "window_id": 321,
+          "world_rect": [100.0, 200.0, 640.0, 420.0],
+          "requested_frame": [100, 220, 640, 420],
+          "observed_frame": [100, 220, 640, 420],
+          "constrained": false,
+          "suspended": false
+        }
+      ]
+    }
   ]
 }
 ```
+
+`canvas` is present (possibly empty) whenever Canvas mode is configured. Its
+fields:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `display_uuid` | String | The Canvas display (Core Graphics UUID). |
+| `camera` | Array (2 × Float) | Display-local screen position of the world origin. |
+| `zoom` | Float | World-to-screen scale, clamped to `[0.001, 1.0]`. |
+| `surfaces` | Array | One entry per Canvas window, ordered by window id. |
+| `world_rect` | Array (4 × Float) | World-space `[x, y, w, h]` (display-local at zoom 1). |
+| `requested_frame` | Array (4 × Int) or null | Last native frame `[x, y, w, h]` requested by the apply pass. |
+| `observed_frame` | Array (4 × Int) | Last native frame `[x, y, w, h]` observed after an apply. |
+| `constrained` | Boolean | True when the observed native size differs from the requested one (fixed-size app). |
+| `suspended` | Boolean | True when the window is minimized/hidden and the apply pass skips it. |
 
 ### `paneru query virtual-workspaces --json`
 

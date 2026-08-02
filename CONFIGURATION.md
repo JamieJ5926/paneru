@@ -421,3 +421,61 @@ radius = 12.0
 ```
 
 > **Tip:** You can override the `border_radius` for specific applications in the `[windows]` section. See [Window Rules](#6-window-rules).
+## 8. Canvas Mode (`[canvas]`)
+
+Opt-in infinite-canvas management: windows on the listed displays live in a
+world space with camera pan, cursor-anchored zoom (clamped between `0.001` and
+`1.0`), one-shot edge snapping, home, and fit-all instead of layout strips.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `displays` | Array (String) | `[]` | Display UUIDs whose windows are owned by the Canvas engine. Empty or missing means no Canvas displays (normal strip behavior everywhere). Matching is ASCII case-insensitive. |
+
+Rules:
+
+- **Fail-closed:** an empty or missing `[canvas]` table disables Canvas mode.
+- **Exclusion wins:** a display listed in both `[options].excluded_displays`
+  and `[canvas].displays` is treated as excluded; its windows keep their OS
+  frames untouched.
+- **Routing:** windows on Canvas displays route through the managed floating
+  layer and never enter layout strips. All other displays keep normal strip
+  behavior.
+- **Frames:** the Canvas engine is the only frame authority for its windows;
+  the native frame is the world rect transformed by the camera/zoom and
+  translated into display coordinates.
+
+**Example:**
+
+```toml
+[canvas]
+# The Perspective virtual display becomes an infinite canvas; the physical
+# displays keep normal tiling.
+displays = ["9D591927-AB36-407B-A9E5-1F26E167974E"]
+```
+
+### Commands
+
+All commands take an optional trailing display UUID; without one they apply
+only when exactly one Canvas display is configured (otherwise they fail with
+an error rather than guessing):
+
+```text
+canvas pan <dx> <dy> [display-uuid]          # move the camera by screen px
+canvas zoom <factor> <screen-x> <screen-y> [display-uuid]  # anchored zoom
+canvas home [display-uuid]                   # zoom 1.0, world origin centered
+canvas fit-all [display-uuid]                # frame the world bounding box
+canvas snap [display-uuid]                   # tighten near-miss edges
+```
+
+Bind them like any other command, e.g.:
+
+```toml
+[bindings]
+canvas_pan_west = "cmd + ctrl + alt - h"
+canvas_zoom_out = "cmd + ctrl + alt - minus"
+```
+
+> **Note:** Canvas mode is an experimental feature under active development.
+> The world state is not yet persisted across restarts, and zoom is clamped
+> at `1.0` (native size) — zoom-in beyond 100% is reserved for the
+> capture-backed rendering work.

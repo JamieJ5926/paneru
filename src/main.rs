@@ -7,6 +7,10 @@ use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
+// The canvas_engine public API is library-style: parts are consumed by later
+// phases (gesture routing, cluster moves, capture rendering) and by its tests.
+#[allow(dead_code)]
+mod canvas_engine;
 mod commands;
 mod config;
 mod ecs;

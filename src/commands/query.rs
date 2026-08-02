@@ -184,17 +184,24 @@ fn state_query_handler(
     windows: Windows,
     apps: Query<&Application>,
     window_manager: Res<WindowManager>,
+    canvas_worlds: Res<crate::ecs::canvas::CanvasWorlds>,
 ) {
     for event in messages.read() {
         let Event::StateQuery { kind, respond_to } = event else {
             continue;
         };
 
-        let response =
-            PaneruQueryState::extract(&workspaces, &displays, &windows, &apps, &window_manager)
-                .map_err(|err| err.to_string())
-                .and_then(|state| state.to_query_json(*kind).map_err(|err| err.to_string()))
-                .unwrap_or_else(|err| json!({ "error": err }).to_string());
+        let response = PaneruQueryState::extract(
+            &workspaces,
+            &displays,
+            &windows,
+            &apps,
+            &window_manager,
+            &canvas_worlds,
+        )
+        .map_err(|err| err.to_string())
+        .and_then(|state| state.to_query_json(*kind).map_err(|err| err.to_string()))
+        .unwrap_or_else(|err| json!({ "error": err }).to_string());
         _ = respond_to.send(response);
     }
 }
@@ -345,6 +352,7 @@ fn state_event_broadcast_handler(
     windows: Windows,
     apps: Query<&Application>,
     window_manager: Res<WindowManager>,
+    canvas_worlds: Res<crate::ecs::canvas::CanvasWorlds>,
 ) {
     let events = messages.read().collect::<Vec<_>>();
 
@@ -371,7 +379,14 @@ fn state_event_broadcast_handler(
     }
 
     let state = if intent.requires_state() {
-        match PaneruQueryState::extract(&workspaces, &displays, &windows, &apps, &window_manager) {
+        match PaneruQueryState::extract(
+            &workspaces,
+            &displays,
+            &windows,
+            &apps,
+            &window_manager,
+            &canvas_worlds,
+        ) {
             Ok(state) => Some(state),
             Err(err) => {
                 warn!("extracting query state for broadcast: {err}");
@@ -449,6 +464,7 @@ mod tests {
             version: 1,
             timestamp: 123,
             active,
+            canvas: Vec::new(),
             virtual_workspaces: vec![PaneruVirtualWorkspaceState {
                 number: virtual_workspace_number,
                 native_workspace_id: 10,

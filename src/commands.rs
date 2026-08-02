@@ -5,14 +5,18 @@ use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::system::{Commands, Query, Res, Single};
+use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
 mod query;
 
+use crate::canvas_engine::geom::Rect;
 use crate::config::Config;
+use crate::ecs::canvas::{
+    CanvasWorlds, canvas_fit_all, canvas_home, canvas_pan, canvas_snap, canvas_zoom,
+};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
@@ -117,6 +121,33 @@ pub enum Operation {
     /// `Direction` (West = content moves left with the natural setting).
     /// Uses the same smoothing/fling machinery as a physical wheel tick.
     Scroll(Direction),
+    /// Operates on the opt-in Canvas (infinite-canvas) mode.
+    Canvas(CanvasOperation),
+}
+
+/// Operations for Canvas-mode displays (`[canvas].displays`).
+///
+/// Every operation accepts an optional trailing display UUID; when omitted,
+/// the command applies only if exactly one Canvas display is configured and
+/// not excluded — otherwise it fails with a clear error rather than guessing
+/// the menu-bar display.
+#[derive(Clone, Debug)]
+#[allow(clippy::module_name_repetitions)]
+pub enum CanvasOperation {
+    /// `canvas pan <dx> <dy> [display-uuid]` — move the camera by screen px
+    /// (content follows the drag).
+    Pan(f64, f64, Option<String>),
+    /// `canvas zoom <factor> <screen-x> <screen-y> [display-uuid]` — multiply
+    /// the zoom by `factor`, anchored at the display-local screen point.
+    Zoom(f64, f64, f64, Option<String>),
+    /// `canvas home [display-uuid]` — zoom 1.0 with the world origin at the
+    /// viewport center.
+    Home(Option<String>),
+    /// `canvas fit-all [display-uuid]` — frame the world bounding box.
+    FitAll(Option<String>),
+    /// `canvas snap [display-uuid]` — tighten near-miss edges to exact
+    /// adjacency within the world (diagonal contacts rejected).
+    Snap(Option<String>),
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -163,8 +194,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_raise_floating,
             command_toggle_floating_layer,
             command_swap_focus,
-            snap_window,
-            scroll_strip,
+            (snap_window, scroll_strip, canvas_command_handler),
         ),
     );
 }
@@ -1655,5 +1685,91 @@ mod tests {
             pick_nearest_in_direction(&Direction::Last, focused, candidates),
             None,
         );
+    }
+}
+
+/// Resolves the target Canvas display for an operation: an explicit UUID must
+/// be a configured (and not excluded) Canvas display; without one there must
+/// be exactly one unambiguous Canvas display. Never falls back to the
+/// menu-bar display.
+fn resolve_canvas_display_uuid(
+    op: &CanvasOperation,
+    displays: &Query<'_, '_, &Display>,
+    config: &Config,
+) -> Option<String> {
+    let explicit = match op {
+        CanvasOperation::Pan(_, _, uuid)
+        | CanvasOperation::Zoom(_, _, _, uuid)
+        | CanvasOperation::Home(uuid)
+        | CanvasOperation::FitAll(uuid)
+        | CanvasOperation::Snap(uuid) => uuid.as_deref(),
+    };
+    let canvas_displays = displays
+        .iter()
+        .filter(|display| config.is_canvas_display(display.uuid()))
+        .filter(|display| !config.excludes_display_uuid(display.uuid()))
+        .collect::<Vec<_>>();
+    match explicit {
+        Some(uuid) => canvas_displays
+            .into_iter()
+            .find(|display| display.uuid().eq_ignore_ascii_case(uuid))
+            .map(|display| display.uuid().to_string())
+            .or_else(|| {
+                error!("canvas: display '{uuid}' is not a Canvas display");
+                None
+            }),
+        None if canvas_displays.len() == 1 => Some(canvas_displays[0].uuid().to_string()),
+        None => {
+            error!(
+                "canvas: {} canvas display(s) configured; pass an explicit display uuid",
+                canvas_displays.len()
+            );
+            None
+        }
+    }
+}
+
+/// Applies `canvas ...` operations to the target world. The apply pass
+/// (`canvas_apply_frames`) writes the resulting frames on the next Update.
+#[allow(clippy::needless_pass_by_value)]
+fn canvas_command_handler(
+    mut messages: MessageReader<Event>,
+    mut worlds: ResMut<CanvasWorlds>,
+    displays: Query<&Display>,
+    config: Res<Config>,
+) {
+    for op in filter_window_operations(&mut messages, |op| matches!(op, Operation::Canvas(_))) {
+        let Operation::Canvas(op) = op else {
+            continue;
+        };
+        let Some(uuid) = resolve_canvas_display_uuid(op, &displays, &config) else {
+            continue;
+        };
+        let Some(display) = displays
+            .iter()
+            .find(|display| display.uuid().eq_ignore_ascii_case(&uuid))
+        else {
+            continue;
+        };
+        let viewport = Rect::new(
+            0.0,
+            0.0,
+            display.bounds().width() as f64,
+            display.bounds().height() as f64,
+        );
+        let Some(world) = worlds.world_for_display_mut(&uuid) else {
+            error!("canvas: no world for display {uuid}");
+            continue;
+        };
+        match op {
+            CanvasOperation::Pan(dx, dy, _) => canvas_pan(world, *dx, *dy),
+            CanvasOperation::Zoom(factor, screen_x, screen_y, _) => {
+                canvas_zoom(world, *factor, *screen_x, *screen_y);
+            }
+            CanvasOperation::Home(_) => canvas_home(world, viewport),
+            CanvasOperation::FitAll(_) => canvas_fit_all(world, viewport),
+            CanvasOperation::Snap(_) => canvas_snap(world),
+        }
+        info!("canvas: applied {op:?} on display {uuid}");
     }
 }

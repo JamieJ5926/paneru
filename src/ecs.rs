@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{PostUpdate, PreUpdate, Startup};
+use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::Messages;
@@ -36,6 +37,7 @@ use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
+pub mod canvas;
 pub mod display;
 pub mod focus;
 pub mod layout;
@@ -89,8 +91,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
 
     app.add_systems(
         Startup,
-        (systems::gather_displays, systems::gather_initial_processes).chain(),
+        (
+            systems::gather_displays,
+            systems::gather_initial_processes,
+            canvas::canvas_init_worlds,
+        )
+            .chain(),
     );
+    app.init_resource::<canvas::CanvasWorlds>();
     app.add_systems(
         PreUpdate,
         (systems::window_creation_event, systems::pump_events),
@@ -129,6 +137,21 @@ pub fn register_systems(app: &mut bevy::app::App) {
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_secs(300))),
             state::cleanup_on_exit,
+        ),
+    );
+    let config_changed = |config: Res<Config>| config.is_changed();
+    app.add_systems(
+        Update,
+        (
+            (
+                canvas::canvas_migrate_on_reload.run_if(config_changed),
+                canvas::canvas_seed_surfaces,
+                canvas::canvas_apply_frames
+                    .run_if(not(resource_exists::<Initializing>)),
+                canvas::canvas_momentum_tick,
+                canvas::canvas_cleanup_removed,
+            )
+                .chain(),
         ),
     );
     app.add_systems(
@@ -304,6 +327,14 @@ pub enum Unmanaged {
     /// frame untouched and keep it outside all layout strips.
     ExcludedDisplay,
 }
+
+/// Marker on windows owned by the Canvas engine (opt-in `[canvas].displays`
+/// displays). Such windows route through the managed floating layer
+/// (`Unmanaged::Floating`) and their frames are written only by the Canvas
+/// apply pass. Removing the marker (and `Unmanaged`) returns the window to
+/// normal strip ownership via the existing `On<Remove, Unmanaged>` observer.
+#[derive(Component)]
+pub struct CanvasManaged;
 
 #[derive(Clone, Component, Copy, Debug)]
 pub struct PreviousManagedStrip {

@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 use crate::{
-    commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
+    commands::{CanvasOperation, Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
     manager::ProcessApi,
     platform::{Modifiers, OSStatus, macos_major_version},
 };
@@ -368,6 +368,7 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
         "printstate" => Command::PrintState,
         "window" => Command::Window(parse_operation(&argv[1..])?),
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
+        "canvas" => Command::Window(Operation::Canvas(parse_canvas_operation(&argv[1..])?)),
         "quit" => Command::Quit,
         "restart" => Command::Restart,
         _ => {
@@ -375,6 +376,52 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
                 "{}: Unhandled command '{argv:?}'",
                 function_name!()
             )));
+        }
+    };
+    Ok(out)
+}
+
+/// Parses `canvas ...` operation arguments into a `CanvasOperation`.
+///
+/// Forms (display UUID is optional everywhere):
+/// - `canvas pan <dx> <dy> [display-uuid]`
+/// - `canvas zoom <factor> <screen-x> <screen-y> [display-uuid]`
+/// - `canvas home [display-uuid]`
+/// - `canvas fit-all [display-uuid]`
+/// - `canvas snap [display-uuid]`
+fn parse_canvas_operation(argv: &[&str]) -> Result<CanvasOperation> {
+    let empty = "";
+    let cmd = *argv.first().unwrap_or(&empty);
+    let err = || {
+        Error::InvalidConfig(format!(
+            "{}: Invalid canvas command '{argv:?}'",
+            function_name!()
+        ))
+    };
+    let parse_f64 = |index: usize| -> Result<f64> {
+        argv.get(index)
+            .ok_or_else(err)
+            .and_then(|value| value.parse::<f64>().map_err(|_| err()))
+    };
+    let display_uuid = argv.get(1).map(|s| s.to_string());
+
+    let out = match cmd {
+        "pan" => CanvasOperation::Pan(
+            parse_f64(1)?,
+            parse_f64(2)?,
+            argv.get(3).copied().map(str::to_string),
+        ),
+        "zoom" => CanvasOperation::Zoom(
+            parse_f64(1)?,
+            parse_f64(2)?,
+            parse_f64(3)?,
+            argv.get(4).copied().map(str::to_string),
+        ),
+        "home" => CanvasOperation::Home(display_uuid),
+        "fit-all" => CanvasOperation::FitAll(display_uuid),
+        "snap" => CanvasOperation::Snap(display_uuid),
+        _ => {
+            return Err(err());
         }
     };
     Ok(out)
@@ -562,6 +609,17 @@ impl Config {
             .excluded_displays
             .iter()
             .any(|excluded| excluded.eq_ignore_ascii_case(uuid))
+    }
+
+    /// Returns `true` if the given display UUID is listed in
+    /// `canvas.displays`. Matching is ASCII case-insensitive so lowercase
+    /// config values still match Core Graphics' uppercase UUIDs.
+    pub fn is_canvas_display(&self, uuid: &str) -> bool {
+        self.inner()
+            .canvas
+            .displays
+            .iter()
+            .any(|canvas| canvas.eq_ignore_ascii_case(uuid))
     }
 
     pub fn swipe_gesture_direction(&self) -> SwipeGestureDirection {
@@ -1059,6 +1117,12 @@ struct InnerConfig {
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
+    /// Opt-in infinite-canvas mode: display UUIDs whose windows are managed
+    /// by the Canvas engine (world/pan/zoom) instead of layout strips.
+    /// Empty/missing means no Canvas displays. `options.excluded_displays`
+    /// wins over Canvas selection.
+    #[serde(default)]
+    canvas: CanvasOptions,
 }
 
 impl InnerConfig {
@@ -1246,12 +1310,26 @@ pub struct MainOptions {
     /// Off by default.
     pub insert_windows_mid_strip: Option<bool>,
 
-    /// Display UUIDs excluded from Paneru management (no tiling or scroll
-    /// management) while all unlisted displays, including future virtual
-    /// displays, remain managed. Matching is ASCII case-insensitive.
-    /// Default: empty (manage every display).
+/// Display UUIDs excluded from Paneru management (no tiling or scroll
+/// management) while all unlisted displays, including future virtual
+/// displays, remain managed. Matching is ASCII case-insensitive.
+/// Default: empty (manage every display).
+#[serde(default)]
+pub excluded_displays: Vec<String>,
+}
+
+/// Opt-in Canvas (infinite-canvas) mode configuration.
+///
+/// `displays` lists display UUIDs whose windows are owned by the Canvas
+/// engine (world transforms, pan, cursor-anchored zoom, snap, clustering)
+/// instead of layout strips. Windows on Canvas displays route through the
+/// floating layer; `options.excluded_displays` wins over Canvas selection.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CanvasOptions {
+    /// Display UUIDs in Canvas mode. Matching is ASCII case-insensitive.
+    /// Default: empty (no Canvas displays; strip behavior everywhere).
     #[serde(default)]
-    pub excluded_displays: Vec<String>,
+    pub displays: Vec<String>,
 }
 
 /// Returns a default set of column widths.
@@ -2256,6 +2334,67 @@ excluded_displays = [
     assert!(config.excludes_display_uuid("67E6534D-7C11-4D35-8F38-A0304EFFCA7A"));
     assert!(config.excludes_display_uuid("d235d638-045f-4df8-bd97-452e31e3144f"));
     assert!(!config.excludes_display_uuid("00000000-0000-0000-0000-000000000000"));
+}
+
+#[test]
+fn test_canvas_displays_default_empty() {
+    let config = Config::default();
+    assert!(!config.is_canvas_display("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    assert!(!config.is_canvas_display(""));
+}
+
+#[test]
+fn test_canvas_displays_parse_single() {
+    let input = r#"
+[options]
+
+[canvas]
+displays = ["D235D638-045F-4DF8-BD97-452E31E3144F"]
+
+[bindings]
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    assert!(config.is_canvas_display("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    assert!(!config.is_canvas_display("67E6534D-7C11-4D35-8F38-A0304EFFCA7A"));
+}
+
+#[test]
+fn test_canvas_displays_case_insensitive() {
+    let input = r#"
+[options]
+
+[canvas]
+displays = ["d235d638-045f-4df8-bd97-452e31e3144f"]
+
+[bindings]
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    assert!(config.is_canvas_display("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    assert!(config.is_canvas_display("d235d638-045f-4df8-bd97-452e31e3144f"));
+}
+
+#[test]
+fn test_canvas_displays_parse_multiple_and_exclusion_wins() {
+    let input = r#"
+[options]
+excluded_displays = ["D235D638-045F-4DF8-BD97-452E31E3144F"]
+
+[canvas]
+displays = [
+  "D235D638-045F-4DF8-BD97-452E31E3144F",
+  "67E6534D-7C11-4D35-8F38-A0304EFFCA7A",
+]
+
+[bindings]
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    // Both lists accept the UUIDs...
+    assert!(config.is_canvas_display("67E6534D-7C11-4D35-8F38-A0304EFFCA7A"));
+    assert!(config.excludes_display_uuid("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    // ...and callers must treat exclusion as winning (routing order).
+    let both = config.is_canvas_display("D235D638-045F-4DF8-BD97-452E31E3144F")
+        && config.excludes_display_uuid("D235D638-045F-4DF8-BD97-452E31E3144F");
+    assert!(both);
 }
 
 #[test]

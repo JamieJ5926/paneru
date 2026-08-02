@@ -1,3 +1,4 @@
+mod canvas;
 mod display;
 mod harness;
 mod interaction;

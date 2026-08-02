@@ -19,8 +19,8 @@ use crate::ecs::state::{
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RefreshWindowSizes, RestoreWindowState,
-    SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, CanvasManaged, RefreshWindowSizes,
+    RestoreWindowState, SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -507,6 +507,19 @@ pub(super) fn restore_window_state(
             for entity in strip.all_windows() {
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+                }
+            }
+            continue;
+        }
+
+        // Canvas displays: windows keep their OS frames and become Canvas
+        // surfaces (seeded from the actual frames by canvas_seed_surfaces).
+        // No layout strip is spawned for the world.
+        if config.is_canvas_display(display.uuid()) {
+            for entity in strip.all_windows() {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(Unmanaged::Floating);
+                    entity_commands.try_insert(CanvasManaged);
                 }
             }
             continue;

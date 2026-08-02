@@ -25,8 +25,8 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, CanvasManaged, DockPosition, Initializing, LayoutPosition,
+    Position, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
     VerifyWindowPosition, WidthRatio, WindowProperties,
 };
 use crate::events::Event;
@@ -515,11 +515,19 @@ pub(super) fn window_unmanaged_trigger(
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
+    canvas_windows: Query<Entity, With<CanvasManaged>>,
     mut commands: Commands,
 ) {
     const UNMANAGED_MAX_SCREEN_RATIO_NUM: i32 = 4;
     const UNMANAGED_MAX_SCREEN_RATIO_DEN: i32 = 5;
     const UNMANAGED_POP_OFFSET: i32 = 32;
+
+    // Canvas-owned windows route through the floating layer but keep their
+    // frames entirely under the Canvas engine's control: no clamping, no
+    // grid-ratio repositioning, no pop-into-bounds.
+    if canvas_windows.contains(trigger.event().entity) {
+        return;
+    }
 
     fn clamp_origin_to_bounds(origin: IRect, size: Size, bounds: IRect) -> IRect {
         let max = (bounds.max - size).max(bounds.min);
@@ -995,6 +1003,13 @@ pub(super) fn apply_window_defaults(
             continue;
         }
 
+        // Canvas display: no padding or resizing here — the Canvas engine is
+        // the only frame authority for these windows.
+        if config.is_canvas_display(display.uuid()) {
+            debug!("Skipping window defaults on canvas display");
+            continue;
+        }
+
         let properties = WindowProperties::new(app, &window, &config);
         debug!("Applying window defaults for '{}'", window.id());
 
@@ -1123,6 +1138,31 @@ pub(super) fn apply_window_positions(
             }
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+            }
+            continue;
+        }
+
+        // Canvas display: route through the managed floating layer; the
+        // Canvas engine owns frames. Exclusion was checked above and wins.
+        let canvas = windows
+            .frame(entity)
+            .and_then(|frame| {
+                displays
+                    .iter()
+                    .find(|display| display.contains_frame(frame))
+            })
+            .map(|display| config.is_canvas_display(display.uuid()))
+            .unwrap_or_else(|| config.is_canvas_display(active_display.uuid()));
+
+        if canvas {
+            for (mut strip, _) in &mut workspaces {
+                if strip.contains(entity) {
+                    strip.remove(entity);
+                }
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(Unmanaged::Floating);
+                entity_commands.try_insert(CanvasManaged);
             }
             continue;
         }

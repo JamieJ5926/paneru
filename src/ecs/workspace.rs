@@ -22,9 +22,9 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, NativeFullscreenMarker, Position,
-    RefreshWindowSizes, RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt,
-    Timeout, Unmanaged,
+    ActiveWorkspaceMarker, Bounds, CanvasManaged, DockPosition, Initializing, NativeFullscreenMarker,
+    Position, RefreshWindowSizes, RepositionMarker, Scrolling, SelectedVirtualMarker,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -221,6 +221,7 @@ fn detect_moved_windows(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut ignored_windows: Local<HashSet<WinID>>,
+    canvas_windows: Query<Entity, With<CanvasManaged>>,
     mut commands: Commands,
 ) {
     let Ok(workspace_id) = workspaces
@@ -256,6 +257,32 @@ fn detect_moved_windows(
         return;
     }
 
+    // A workspace whose parent display is Canvas-managed: windows route
+    // through the floating layer; the Canvas engine owns their frames.
+    if workspaces
+        .get(*activated_workspace)
+        .ok()
+        .and_then(|(_, _, _, child)| displays.get(child.parent()).ok())
+        .is_some_and(|display| config.is_canvas_display(display.uuid()))
+    {
+        if let Ok(present) = window_manager.windows_in_workspace(workspace_id) {
+            for window_id in present {
+                if let Some((_, entity)) = windows.find_managed(window_id) {
+                    for (mut strip, _, _, _) in &mut workspaces {
+                        if strip.contains(entity) {
+                            strip.remove(entity);
+                        }
+                    }
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert(Unmanaged::Floating);
+                        entity_commands.try_insert(CanvasManaged);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     // Managed target: authoritative windows still carrying the excluded marker
     // are eligible for management again; removing the marker lets the existing
     // On<Remove, Unmanaged> observer re-insert them into the strips.
@@ -265,6 +292,20 @@ fn detect_moved_windows(
                 && let Some((_, _, Some(Unmanaged::ExcludedDisplay))) = windows.get_managed(entity)
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
+                entity_commands.try_remove::<Unmanaged>();
+            }
+        }
+    }
+
+    // Canvas windows that landed on a managed (non-canvas) workspace return
+    // to normal strip ownership.
+    if let Ok(present) = window_manager.windows_in_workspace(workspace_id) {
+        for window_id in present {
+            if let Some((_, entity)) = windows.find(window_id)
+                && canvas_windows.contains(entity)
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<CanvasManaged>();
                 entity_commands.try_remove::<Unmanaged>();
             }
         }
