@@ -289,6 +289,9 @@ pub enum Unmanaged {
     Minimized,
     /// The window is hidden.
     Hidden,
+    /// The window lives on a display excluded from management: leave its OS
+    /// frame untouched and keep it outside all layout strips.
+    ExcludedDisplay,
 }
 
 #[derive(Clone, Component, Copy, Debug)]

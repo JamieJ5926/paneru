@@ -538,6 +538,17 @@ impl Config {
         self.options().preset_column_widths
     }
 
+    /// Returns `true` if the given display UUID is listed in
+    /// `options.excluded_displays`. Matching is ASCII case-insensitive so
+    /// lowercase config values still match Core Graphics' uppercase UUIDs.
+    pub fn excludes_display_uuid(&self, uuid: &str) -> bool {
+        self.inner()
+            .options
+            .excluded_displays
+            .iter()
+            .any(|excluded| excluded.eq_ignore_ascii_case(uuid))
+    }
+
     pub fn swipe_gesture_direction(&self) -> SwipeGestureDirection {
         let config = self.inner();
         config
@@ -1157,6 +1168,13 @@ pub struct MainOptions {
     /// shifting the rest) instead of appending it to the end of the strip.
     /// Off by default.
     pub insert_windows_mid_strip: Option<bool>,
+
+    /// Display UUIDs excluded from Paneru management (no tiling or scroll
+    /// management) while all unlisted displays, including future virtual
+    /// displays, remain managed. Matching is ASCII case-insensitive.
+    /// Default: empty (manage every display).
+    #[serde(default)]
+    pub excluded_displays: Vec<String>,
 }
 
 /// Returns a default set of column widths.
@@ -2014,6 +2032,57 @@ fn test_config_defaults() {
     assert_eq!(config.border_width(), 2.0);
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
+}
+
+#[test]
+fn test_excluded_displays_default_empty() {
+    let config = Config::default();
+    assert!(!config.excludes_display_uuid("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    assert!(!config.excludes_display_uuid(""));
+}
+
+#[test]
+fn test_excluded_displays_parse_single() {
+    let input = r#"
+[options]
+excluded_displays = ["D235D638-045F-4DF8-BD97-452E31E3144F"]
+
+[bindings]
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    assert!(config.excludes_display_uuid("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    assert!(!config.excludes_display_uuid("67E6534D-7C11-4D35-8F38-A0304EFFCA7A"));
+}
+
+#[test]
+fn test_excluded_displays_case_insensitive() {
+    // Lowercase config values still match Core Graphics' uppercase UUIDs.
+    let input = r#"
+[options]
+excluded_displays = ["d235d638-045f-4df8-bd97-452e31e3144f"]
+
+[bindings]
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    assert!(config.excludes_display_uuid("D235D638-045F-4DF8-BD97-452E31E3144F"));
+    assert!(config.excludes_display_uuid("d235d638-045f-4df8-bd97-452e31e3144f"));
+}
+
+#[test]
+fn test_excluded_displays_parse_multiple() {
+    let input = r#"
+[options]
+excluded_displays = [
+  "D235D638-045F-4DF8-BD97-452E31E3144F",
+  "67E6534D-7C11-4D35-8F38-A0304EFFCA7A",
+]
+
+[bindings]
+"#;
+    let config = Config::try_from(input).expect("config should parse");
+    assert!(config.excludes_display_uuid("67E6534D-7C11-4D35-8F38-A0304EFFCA7A"));
+    assert!(config.excludes_display_uuid("d235d638-045f-4df8-bd97-452e31e3144f"));
+    assert!(!config.excludes_display_uuid("00000000-0000-0000-0000-000000000000"));
 }
 
 #[test]

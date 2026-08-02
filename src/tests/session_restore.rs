@@ -538,6 +538,84 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
     );
 }
 
+/// A saved strip whose display is excluded from management must not be
+/// restored: the matched window keeps `Unmanaged::ExcludedDisplay` and stays
+/// out of every strip, instead of being re-tiled into the saved layout.
+#[test]
+fn test_startup_restore_keeps_excluded_display_window_unmanaged() {
+    let config = Config::try_from(
+        format!(
+            "[options]\nexcluded_displays = [\"{}\"]\n\n[bindings]\n",
+            Display::mock_uuid(EXT_DISPLAY_ID)
+        )
+        .as_str(),
+    )
+    .expect("config should parse");
+    assert!(config.excludes_display_uuid(&Display::mock_uuid(EXT_DISPLAY_ID)));
+
+    let mut harness = TestHarness::new().with_config(config);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let origin = Origin::new(0, -TEST_WINDOW_WIDTH);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        300,
+        IRect::from_corners(origin, origin + size),
+    );
+
+    harness.world().insert_resource(PaneruState {
+        version: 2,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![
+            saved_display(TEST_DISPLAY_ID, true),
+            saved_display(EXT_DISPLAY_ID, false),
+        ],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: EXT_WORKSPACE_ID,
+            display_id: Some(EXT_DISPLAY_ID),
+            active_virtual_index: Some(0),
+            strips: vec![SavedStrip {
+                virtual_index: 0,
+                columns: vec![SavedColumn::Single(saved_window(300))],
+            }],
+        }],
+    });
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, |world, _state| {
+            let restored_window = find_window_entity(300, world);
+            assert!(
+                matches!(
+                    world.entity(restored_window).get::<Unmanaged>(),
+                    Some(Unmanaged::ExcludedDisplay)
+                ),
+                "matched window on an excluded display should keep ExcludedDisplay"
+            );
+            let mut query = world.query::<&LayoutStrip>();
+            assert!(
+                query
+                    .iter(world)
+                    .all(|strip| !strip.contains(restored_window)),
+                "matched window on an excluded display must not be restored into any strip"
+            );
+        })
+        .run(commands);
+}
+
 #[test]
 fn test_late_startup_window_restores_during_grace_period() {
     let mut harness = TestHarness::new();

@@ -479,6 +479,7 @@ mod tests {
         // 1024x768 test display with a 20px menubar, mirrors the values in src/tests.rs.
         Display::new(
             1,
+            Display::mock_uuid(1),
             IRect {
                 min: Origin::new(0, 0),
                 max: Origin::new(1024, 768),

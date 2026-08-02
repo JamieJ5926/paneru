@@ -34,6 +34,24 @@ General behavior settings for the window manager.
 | `disable_native_tabs` | Boolean | `false` | If enabled, Paneru will not auto-merge a newly-spawned window into a tab group with an existing same-app sibling that shares its frame. Use this if you find unrelated windows being grouped together. |
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
+| `excluded_displays` | Array (String) | `[]` | Display UUIDs that Paneru will not manage (no tiling or scroll management) while all unlisted displays, including future virtual displays, remain managed. Matching is ASCII case-insensitive. |
+
+#### Excluding displays from management
+
+Set `excluded_displays` to the stable Core Graphics UUIDs of the displays you
+want Paneru to leave alone — e.g. a physical portrait monitor used as a
+reference screen. All other displays stay managed.
+
+```toml
+[options]
+# Exclude the physical portrait display; the main display and any future
+# virtual displays remain managed.
+excluded_displays = ["67E6534D-7C11-4D35-8F38-A0304EFFCA7A"]
+```
+
+Display UUIDs are the stable identifiers Core Graphics assigns to each monitor
+(`CGDisplayCreateUUIDFromDisplayID`), formatted like
+`D235D638-045F-4DF8-BD97-452E31E3144F`. Matching is case-insensitive.
 
 ---
 

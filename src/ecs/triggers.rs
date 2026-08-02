@@ -428,9 +428,12 @@ pub(super) fn dispatch_application_messages(
     windows: Windows,
     applications: Query<(&Application, &Children)>,
     unmanaged_query: Query<&Unmanaged>,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
+    let excluded = config.excludes_display_uuid(active_display.display().uuid());
 
     for event in messages.read() {
         match event {
@@ -447,7 +450,13 @@ pub(super) fn dispatch_application_messages(
                     && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_remove::<Unmanaged>();
+                    if excluded {
+                        // Restore on an excluded display: stay unmanaged instead
+                        // of being remanaged into the layout.
+                        entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+                    } else {
+                        entity_commands.try_remove::<Unmanaged>();
+                    }
                 }
             }
 
@@ -476,11 +485,16 @@ pub(super) fn dispatch_application_messages(
                 };
                 for entity in children {
                     // Only restore windows that were hidden by the app hide/show cycle.
-                    // Preserve Floating and Minimized states.
+                    // Preserve Floating and Minimized states. On an excluded
+                    // display, restore as excluded instead of remanaging.
                     if matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden))
                         && let Ok(mut entity_commands) = commands.get_entity(*entity)
                     {
-                        entity_commands.try_remove::<Unmanaged>();
+                        if excluded {
+                            entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+                        } else {
+                            entity_commands.try_remove::<Unmanaged>();
+                        }
                     }
                 }
             }
@@ -949,16 +963,37 @@ pub(super) fn spawn_window_trigger(
 pub(super) fn apply_window_defaults(
     added: Populated<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Added<Window>>,
     apps: Query<(Entity, &Application)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
 ) {
-    for (ref mut window, mut position, mut bounds, child) in added {
+    for (mut window, mut position, mut bounds, child) in added {
         let Ok((_, app)) = apps.get(child.parent()) else {
             continue;
         };
 
-        let properties = WindowProperties::new(app, window, &config);
+        // Classify the window against the display its frame actually lies on
+        // (frame center), falling back to the active display when no display
+        // contains the frame. A window born on an inactive display must not
+        // be excluded or sized based on the active display's bounds.
+        let frame = IRect::from_corners(position.0, position.0 + bounds.0);
+        let (display, dock) = displays
+            .iter()
+            .find(|(display, _)| display.contains_frame(frame))
+            .map_or_else(
+                || (active_display.display(), active_display.dock()),
+                |found| found,
+            );
+
+        // Excluded display: leave the OS frame untouched - no padding, resizing,
+        // or repositioning for windows that the manager does not control.
+        if config.excludes_display_uuid(display.uuid()) {
+            debug!("Skipping window defaults on excluded display");
+            continue;
+        }
+
+        let properties = WindowProperties::new(app, &window, &config);
         debug!("Applying window defaults for '{}'", window.id());
 
         let initializing = initializing.is_some();
@@ -967,7 +1002,7 @@ pub(super) fn apply_window_defaults(
         if properties.floating() {
             // Skip grid_ratios during init: we don't know this window's display.
             if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
-                let bounds = active_display.actual_bounds(&config);
+                let bounds = display.actual_display_bounds(dock, &config);
                 let x = bounds.min.x + (f64::from(bounds.width()) * rx) as i32;
                 let y = bounds.min.y + (f64::from(bounds.height()) * ry) as i32;
                 let w = (f64::from(bounds.width()) * rw) as i32;
@@ -992,7 +1027,7 @@ pub(super) fn apply_window_defaults(
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio() {
             _ = window.update_frame().inspect_err(|err| error!("{err}"));
-            let bounds = active_display.actual_bounds(&config);
+            let bounds = display.actual_display_bounds(dock, &config);
             let (_, pad_right, _, pad_left) = config.edge_padding();
             let padded_width = bounds.width() - pad_left - pad_right;
             let new_width = (f64::from(padded_width) * width).round() as i32;
@@ -1012,6 +1047,8 @@ pub(super) fn apply_window_positions(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
+    displays: Query<&Display>,
+    active_display: Single<&Display, With<ActiveDisplayMarker>>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
@@ -1056,6 +1093,34 @@ pub(super) fn apply_window_positions(
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Unmanaged::Floating);
+            }
+            continue;
+        }
+
+        // Classify the window against the display its frame actually lies on
+        // (frame center), falling back to the active display when no display
+        // contains the frame. A window born on an inactive (possibly
+        // excluded) display must not be classified by the active display.
+        let excluded = windows
+            .frame(entity)
+            .and_then(|frame| {
+                displays
+                    .iter()
+                    .find(|display| display.contains_frame(frame))
+            })
+            .map(|display| config.excludes_display_uuid(display.uuid()))
+            .unwrap_or_else(|| config.excludes_display_uuid(active_display.uuid()));
+
+        if excluded {
+            // Excluded display: leave the OS frame untouched and keep the
+            // window outside all strips.
+            for (mut strip, _) in &mut workspaces {
+                if strip.contains(entity) {
+                    strip.remove(entity);
+                }
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(Unmanaged::ExcludedDisplay);
             }
             continue;
         }

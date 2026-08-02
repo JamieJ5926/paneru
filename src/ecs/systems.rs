@@ -179,7 +179,9 @@ pub(crate) fn finish_setup(
     applications: Query<&Application>,
     mut bruteforce_tasks: Query<(Entity, &mut BruteforceWindows)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>, &ChildOf)>,
+    displays: Query<&Display>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     if !process_query.is_empty() {
@@ -207,8 +209,11 @@ pub(crate) fn finish_setup(
     );
 
     let mut focused_managed_window = false;
-    for (mut strip, active_strip, _) in &mut workspaces {
+    for (mut strip, active_strip, child) in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
+        let excluded = displays
+            .get(child.parent())
+            .is_ok_and(|display| config.excludes_display_uuid(display.uuid()));
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
             .inspect_err(|err| {
@@ -231,6 +236,28 @@ pub(crate) fn finish_setup(
                     })
                     .collect::<Vec<_>>()
             });
+
+        if excluded {
+            // Excluded display: leave OS frames untouched and keep every
+            // window outside all strips. Authoritative present windows that
+            // would otherwise be managed carry the ExcludedDisplay marker.
+            for entity in strip.all_windows() {
+                strip.remove(entity);
+            }
+            if let Some(workspace_windows) = workspace_windows {
+                for (_, entity) in workspace_windows {
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+                    }
+                }
+            }
+            debug!(
+                "space {}: excluded display, strip emptied {strip:?}",
+                strip.id()
+            );
+            continue;
+        }
+
         let Some(workspace_windows) = workspace_windows else {
             continue;
         };

@@ -6,7 +6,9 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, MouseMove, MoveFocus, Operation};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{ActiveWorkspaceMarker, DockPosition, RefreshWindowSizes, Timeout};
+use crate::ecs::{
+    ActiveWorkspaceMarker, DockPosition, RefreshWindowSizes, SpawnWindowTrigger, Timeout, Unmanaged,
+};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size};
 use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
@@ -476,4 +478,158 @@ fn test_wake_refreshes_active_workspace() {
             );
         })
         .run(commands);
+}
+
+/// Windows on a display excluded from management must start unmanaged: they
+/// carry `Unmanaged::ExcludedDisplay`, stay outside every strip, and keep
+/// their OS frame untouched (no padding, default resize, or reposition).
+#[test]
+fn excluded_display_windows_start_unmanaged() {
+    let config = Config::try_from(
+        format!(
+            "[options]\nexcluded_displays = [\"{}\"]\n\n[bindings]\n",
+            Display::mock_uuid(TEST_DISPLAY_ID)
+        )
+        .as_str(),
+    )
+    .expect("config should parse");
+    assert!(config.excludes_display_uuid(&Display::mock_uuid(TEST_DISPLAY_ID)));
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            for window_id in [0, 1] {
+                let entity = find_window_entity(window_id, world);
+                assert!(
+                    matches!(
+                        world.entity(entity).get::<Unmanaged>(),
+                        Some(Unmanaged::ExcludedDisplay)
+                    ),
+                    "window {window_id} should carry ExcludedDisplay"
+                );
+                let mut strips = world.query::<&LayoutStrip>();
+                assert!(
+                    strips.iter(world).all(|strip| !strip.contains(entity)),
+                    "window {window_id} must not be a member of any strip"
+                );
+            }
+            // No default resize/padding/reposition was applied.
+            assert_window_at!(world, 0, 0, 0);
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// A window born on an excluded secondary display must be classified by its
+/// own frame, not by the active display: it carries `Unmanaged::ExcludedDisplay`,
+/// stays outside every strip, and keeps its OS frame untouched even while the
+/// main display remains active. The main display's windows stay managed.
+#[test]
+fn excluded_secondary_display_window_stays_excluded_while_main_active() {
+    let config = Config::try_from(
+        format!(
+            "[options]\nexcluded_displays = [\"{}\"]\n\n[bindings]\n",
+            Display::mock_uuid(EXT_DISPLAY_ID)
+        )
+        .as_str(),
+    )
+    .expect("config should parse");
+    assert!(config.excludes_display_uuid(&Display::mock_uuid(EXT_DISPLAY_ID)));
+    assert!(!config.excludes_display_uuid(&Display::mock_uuid(TEST_DISPLAY_ID)));
+
+    // Main display is added first and stays active; the excluded secondary
+    // display sits above it, mirroring the dual-preview-on-DELL scenario.
+    let mut harness = TestHarness::new().with_config(config).with_windows(2);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    assert_eq!(
+        harness.mock_state.active_display(),
+        TEST_DISPLAY_ID,
+        "main display must remain active"
+    );
+
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let ext_frame = IRect::from_corners(ext_origin, ext_origin + size);
+    let window = harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 100, ext_frame);
+    harness.world().trigger(SpawnWindowTrigger(vec![window]));
+
+    harness
+        .on_iteration(1, move |world, _state| {
+            let excluded_entity = find_window_entity(100, world);
+            assert!(
+                matches!(
+                    world.entity(excluded_entity).get::<Unmanaged>(),
+                    Some(Unmanaged::ExcludedDisplay)
+                ),
+                "window on excluded secondary display should carry ExcludedDisplay while main is active"
+            );
+            let mut strips = world.query::<&LayoutStrip>();
+            assert!(
+                strips
+                    .iter(world)
+                    .all(|strip| !strip.contains(excluded_entity)),
+                "excluded window must not be a member of any strip"
+            );
+            // No default resize/padding/reposition was applied.
+            assert_window_at!(world, 100, ext_origin.x, ext_origin.y);
+            assert_window_size!(world, 100, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+
+            // The main display's window remains managed by default.
+            for window_id in [0, 1] {
+                let entity = find_window_entity(window_id, world);
+                assert!(
+                    world.entity(entity).get::<Unmanaged>().is_none(),
+                    "window {window_id} on main display should be managed"
+                );
+                assert_on_workspace!(world, window_id, TEST_WORKSPACE_ID);
+            }
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// Regression guard: with no exclusion configured, windows must still be
+/// managed by default — inserted into the active strip with no `Unmanaged`.
+#[test]
+fn managed_display_windows_stay_managed_by_default() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, _state| {
+            for window_id in [0, 1] {
+                let entity = find_window_entity(window_id, world);
+                assert!(
+                    world.entity(entity).get::<Unmanaged>().is_none(),
+                    "window {window_id} should be managed (no Unmanaged)"
+                );
+                assert_on_workspace!(world, window_id, TEST_WORKSPACE_ID);
+            }
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
 }

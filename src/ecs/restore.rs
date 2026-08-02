@@ -483,12 +483,6 @@ pub(super) fn restore_window_state(
         }
     }
 
-    for entity in &plan.consumed_entities {
-        if let Ok(mut entity_commands) = commands.get_entity(*entity) {
-            entity_commands.try_remove::<Unmanaged>();
-        }
-    }
-
     let mut restored_strips = 0;
     for planned in &plan.strips {
         let Some((display_entity, display)) = select_display(
@@ -507,6 +501,21 @@ pub(super) fn restore_window_state(
         let mut strip = layout_strip_from_plan(planned);
         if strip.all_windows().is_empty() {
             continue;
+        }
+
+        if config.excludes_display_uuid(display.uuid()) {
+            for entity in strip.all_windows() {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+                }
+            }
+            continue;
+        }
+
+        for entity in strip.all_windows() {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<Unmanaged>();
+            }
         }
 
         // Keep unmatched startup windows on the same normal row. Fullscreen

@@ -18,6 +18,11 @@ use crate::{
 pub struct Display {
     /// The unique identifier for this display provided by Core Graphics.
     id: CGDirectDisplayID,
+    /// Stable display UUID provided by Core Graphics
+    /// (`CGDisplayCreateUUIDFromDisplayID`), e.g.
+    /// "D235D638-045F-4DF8-BD97-452E31E3144F". Matching against
+    /// `options.excluded_displays` is ASCII case-insensitive.
+    uuid: String,
     /// The physical bounds (origin and size) of the display.
     bounds: IRect,
     /// The height of the menubar on this display (from the system).
@@ -33,21 +38,30 @@ impl Display {
     /// # Arguments
     ///
     /// * `id` - The `CGDirectDisplayID` of the display.
-    /// * `spaces` - A vector of space IDs associated with this display.
+    /// * `uuid` - The stable Core Graphics UUID string of the display.
     /// * `bounds` - The `CGRect` representing the bounds of the display.
     /// * `menubar_height` - The height of the menubar on this display.
     ///
     /// # Returns
     ///
     /// A new `Display` instance.
-    pub fn new(id: CGDirectDisplayID, bounds: IRect, menubar_height: i32) -> Self {
+    pub fn new(id: CGDirectDisplayID, uuid: String, bounds: IRect, menubar_height: i32) -> Self {
         Self {
             id,
+            uuid,
             bounds,
             menubar_height,
             menubar_height_override: None,
             notch_height: 0,
         }
+    }
+
+    /// Returns a deterministic, valid-format UUID string for a mock display
+    /// id, so tests can construct `Display`s without Core Graphics.
+    /// Distinct ids always yield distinct UUIDs.
+    #[cfg(test)]
+    pub fn mock_uuid(id: CGDirectDisplayID) -> String {
+        format!("{:08X}-0000-0000-0000-{:012X}", id, id)
     }
 
     /// Converts a `CGDirectDisplayID` to a `CFUUID` string.
@@ -102,6 +116,11 @@ impl Display {
         self.id
     }
 
+    /// Returns the stable Core Graphics UUID string of the display.
+    pub fn uuid(&self) -> &str {
+        &self.uuid
+    }
+
     pub fn locate_dock(&self, visible_frame: &IRect) -> DockPosition {
         if self.bounds.min.x < visible_frame.min.x {
             DockPosition::Left(visible_frame.min.x - self.bounds.min.x)
@@ -120,6 +139,18 @@ impl Display {
         let mut bounds = self.bounds;
         bounds.min.y += self.menubar_height();
         bounds
+    }
+
+    /// Returns `true` when the center of `frame` lies within this display's
+    /// physical bounds. Used to classify a window against the display its
+    /// frame was actually created on, independent of the active display.
+    pub fn contains_frame(&self, frame: IRect) -> bool {
+        let center = frame.center();
+        let bounds = self.bounds;
+        center.x >= bounds.min.x
+            && center.x <= bounds.max.x
+            && center.y >= bounds.min.y
+            && center.y <= bounds.max.y
     }
 
     pub fn width(&self) -> i32 {
@@ -158,5 +189,43 @@ impl Display {
             _ => (),
         }
         viewport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::Origin;
+
+    #[test]
+    fn mock_uuid_is_deterministic_valid_and_unique() {
+        // Deterministic: same id always maps to the same UUID.
+        assert_eq!(Display::mock_uuid(1), Display::mock_uuid(1));
+        assert_eq!(
+            Display::mock_uuid(1),
+            "00000001-0000-0000-0000-000000000001"
+        );
+        // Unique across ids.
+        assert_ne!(Display::mock_uuid(1), Display::mock_uuid(2));
+        // Valid UUID shape: 8-4-4-4-12 hexadecimal digits.
+        let uuid = Display::mock_uuid(0xDEAD_BEEF);
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(uuid.chars().filter(|c| *c == '-').count(), 4);
+        assert!(uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
+    }
+
+    #[test]
+    fn uuid_accessor_returns_stored_value() {
+        let display = Display::new(
+            1,
+            Display::mock_uuid(1),
+            IRect {
+                min: Origin::new(0, 0),
+                max: Origin::new(1024, 768),
+            },
+            20,
+        );
+        assert_eq!(display.id(), 1);
+        assert_eq!(display.uuid(), "00000001-0000-0000-0000-000000000001");
     }
 }

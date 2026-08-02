@@ -210,7 +210,13 @@ fn workspace_change_handler(
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
     windows: Windows,
-    mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
+    mut workspaces: Query<(
+        &mut LayoutStrip,
+        Entity,
+        Has<NativeFullscreenMarker>,
+        &ChildOf,
+    )>,
+    displays: Query<&Display>,
     apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -224,6 +230,45 @@ fn detect_moved_windows(
         return;
     };
     debug!("workspace {workspace_id}");
+
+    // A workspace whose parent display is excluded from management: its
+    // authoritative windows stay untouched by the layout.
+    if workspaces
+        .get(*activated_workspace)
+        .ok()
+        .and_then(|(_, _, _, child)| displays.get(child.parent()).ok())
+        .is_some_and(|display| config.excludes_display_uuid(display.uuid()))
+    {
+        if let Ok(present) = window_manager.windows_in_workspace(workspace_id) {
+            for window_id in present {
+                if let Some((_, entity)) = windows.find_managed(window_id) {
+                    for (mut strip, _, _, _) in &mut workspaces {
+                        if strip.contains(entity) {
+                            strip.remove(entity);
+                        }
+                    }
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert(Unmanaged::ExcludedDisplay);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Managed target: authoritative windows still carrying the excluded marker
+    // are eligible for management again; removing the marker lets the existing
+    // On<Remove, Unmanaged> observer re-insert them into the strips.
+    if let Ok(present) = window_manager.windows_in_workspace(workspace_id) {
+        for window_id in present {
+            if let Some((_, entity)) = windows.find(window_id)
+                && let Some((_, _, Some(Unmanaged::ExcludedDisplay))) = windows.get_managed(entity)
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<Unmanaged>();
+            }
+        }
+    }
 
     let strips = workspaces
         .iter()
@@ -278,7 +323,7 @@ fn detect_moved_windows(
     for entity in moved_windows {
         if workspaces
             .iter()
-            .any(|(strip, _, fullscreen)| fullscreen && strip.contains(entity))
+            .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
         {
             // Do not relocate fullscreen windows, this will happen
             // during the destructino of their workspace.
@@ -288,9 +333,9 @@ fn detect_moved_windows(
         debug!("Window {entity} moved to workspace {workspace_id}.");
         let moving_entities = workspaces
             .iter()
-            .find_map(|(strip, _, _)| strip.tab_group(entity))
+            .find_map(|(strip, _, _, _)| strip.tab_group(entity))
             .unwrap_or_else(|| vec![entity]);
-        for (mut strip, strip_entity, _) in &mut workspaces {
+        for (mut strip, strip_entity, _, _) in &mut workspaces {
             if strip_entity == *activated_workspace {
                 strip.append_tab_group(&moving_entities);
             } else {

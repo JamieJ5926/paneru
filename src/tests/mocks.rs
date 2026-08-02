@@ -603,7 +603,12 @@ impl MockState {
                 .values()
                 .map(|d| {
                     (
-                        Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT),
+                        Display::new(
+                            d.id,
+                            Display::mock_uuid(d.id),
+                            d.bounds,
+                            TEST_MENUBAR_HEIGHT,
+                        ),
                         d.workspaces.clone(),
                     )
                 })
