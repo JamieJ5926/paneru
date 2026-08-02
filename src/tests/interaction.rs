@@ -1944,3 +1944,355 @@ fn test_stack_unstack_brings_focused_window_into_view() {
     );
 }
 
+mod drag_reorder_tests {
+    use super::*;
+    use crate::ecs::layout::Column;
+
+    fn mouse_point(origin: Origin) -> CGPoint {
+        CGPoint {
+            x: f64::from(origin.x),
+            y: f64::from(origin.y),
+        }
+    }
+
+    fn mouse_down(origin: Origin, modifiers: Modifiers) -> Event {
+        Event::MouseDown {
+            point: mouse_point(origin),
+            modifiers,
+        }
+    }
+
+    fn mouse_up(origin: Origin, modifiers: Modifiers) -> Event {
+        Event::MouseUp {
+            point: mouse_point(origin),
+            modifiers,
+        }
+    }
+
+    fn mouse_moved(origin: Origin, modifiers: Modifiers) -> Event {
+        Event::MouseMoved {
+            point: mouse_point(origin),
+            modifiers,
+        }
+    }
+
+    fn mouse_dragged(origin: Origin, modifiers: Modifiers) -> Event {
+        Event::MouseDragged {
+            point: mouse_point(origin),
+            modifiers,
+        }
+    }
+
+    fn drag_config() -> Config {
+        (
+            MainOptions {
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(10_000.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into()
+    }
+
+    fn active_column_ids(world: &mut World) -> Vec<i32> {
+        let columns = {
+            let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+            strips
+                .single(world)
+                .expect("one active strip")
+                .all_columns()
+        };
+
+        let mut ids = Vec::with_capacity(columns.len());
+        for column in columns {
+            ids.push(entity_to_window_id(world, column));
+        }
+        ids
+    }
+
+    fn active_strip_x(world: &mut World) -> i32 {
+        let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        strips.single(world).expect("one active strip").0.x
+    }
+
+    fn swap_active_columns(world: &mut World, left: usize, right: usize) {
+        let mut strips = world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+        strips
+            .single_mut(world)
+            .expect("one active strip")
+            .swap(left, right);
+    }
+
+    #[test]
+    fn drag_reorders_first_column_to_last() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(800, 100);
+        let config: Config = (
+            MainOptions {
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(10_000.0),
+                window_hidden_ratio: Some(1.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(3)
+            .on_iteration(1, |world, state| {
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world) + 800, TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(3, |world, _state| {
+                assert_eq!(active_column_ids(world), vec![1, 2, 0]);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_moved(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+
+    #[test]
+    fn drag_reorders_last_column_to_first() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(0, 100);
+
+        TestHarness::new()
+            .with_config(drag_config())
+            .with_windows(3)
+            .on_iteration(0, |world, _state| {
+                // The mock hit-test always selects window 0. Put that window
+                // in the last slot so it represents column C for this drag.
+                swap_active_columns(world, 0, 2);
+                assert_eq!(active_column_ids(world), vec![2, 1, 0]);
+            })
+            .on_iteration(1, |world, state| {
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world), TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(3, |world, _state| {
+                assert_eq!(active_column_ids(world), vec![0, 2, 1]);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_dragged(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+
+    #[test]
+    fn click_below_drag_threshold_keeps_order_and_reshuffles() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(109, 100);
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(false),
+                continuous_swipe: Some(false),
+                focus_follows_mouse: Some(false),
+                animation_speed: Some(10_000.0),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(3)
+            .on_iteration(0, |world, _state| {
+                let mut strips =
+                    world.query_filtered::<&mut Position, With<ActiveWorkspaceMarker>>();
+                strips
+                    .single_mut(world)
+                    .expect("one active strip")
+                    .0
+                    .x = -200;
+            })
+            .on_iteration(3, |world, _state| {
+                assert_eq!(active_column_ids(world), vec![0, 1, 2]);
+                assert_eq!(active_strip_x(world), 0, "click must still reshuffle");
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_moved(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+
+    #[test]
+    fn drag_reorders_stacked_column_without_losing_members() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(800, 100);
+
+        TestHarness::new()
+            .with_config(drag_config())
+            .with_windows(4)
+            .on_iteration(0, |world, _state| {
+                let stacked_member = find_window_entity(1, world);
+                let mut strips =
+                    world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+                strips
+                    .single_mut(world)
+                    .expect("one active strip")
+                    .stack(stacked_member)
+                    .expect("stack window 1 onto window 0");
+            })
+            .on_iteration(1, |world, state| {
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world) + 800, TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(3, |world, _state| {
+                let stacked_top = find_window_entity(0, world);
+                let stacked_member = find_window_entity(1, world);
+                let strip = {
+                    let mut strips =
+                        world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+                    strips.single(world).expect("one active strip").get(2).unwrap()
+                };
+
+                assert_eq!(active_column_ids(world), vec![2, 3, 0]);
+                assert_eq!(strip.window_iter().collect::<Vec<_>>(), vec![stacked_top, stacked_member]);
+                assert!(matches!(strip, Column::Stack(_)));
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_dragged(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+
+    #[test]
+    fn modifier_drag_does_not_reorder() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(800, 100);
+        let config: Config = (
+            MainOptions {
+                focus_follows_mouse: Some(false),
+                mouse_resize_modifier: Some(Modifiers::ALT),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(3)
+            .on_iteration(4, |world, _state| {
+                assert_eq!(active_column_ids(world), vec![0, 1, 2]);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::LALT),
+                mouse_moved(end, Modifiers::LALT),
+                mouse_moved(Origin::new(810, 100), Modifiers::LALT),
+                mouse_up(end, Modifiers::LALT),
+            ]);
+    }
+
+    #[test]
+    fn floating_drag_does_not_reorder() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(700, 100);
+        let mut floating = WindowParams::new("^Window 0$", None);
+        floating.floating = Some(true);
+        let config: Config = (
+            MainOptions {
+                focus_follows_mouse: Some(false),
+                ..Default::default()
+            },
+            vec![floating],
+        )
+            .into();
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(3)
+            .on_iteration(1, |_world, state| {
+                state.os_move_window(0, Origin::new(700, TEST_MENUBAR_HEIGHT));
+            })
+            .on_iteration(3, |world, _state| {
+                let floating_window = find_window_entity(0, world);
+                assert_eq!(active_column_ids(world), vec![1, 2]);
+                assert!(world.entity(floating_window).contains::<Unmanaged>());
+                assert_eq!(
+                    world.get::<Position>(floating_window).unwrap().0.x,
+                    700,
+                    "floating drag must retain its native position"
+                );
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_dragged(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+
+    #[test]
+    fn drag_drop_far_left_clamps_to_first_slot() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(-10_000, 100);
+
+        TestHarness::new()
+            .with_config(drag_config())
+            .with_windows(3)
+            .on_iteration(0, |world, _state| {
+                swap_active_columns(world, 0, 2);
+            })
+            .on_iteration(1, |world, state| {
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world) - 10_000, TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(3, |world, _state| {
+                assert_eq!(active_column_ids(world), vec![0, 2, 1]);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_dragged(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+
+    #[test]
+    fn drag_drop_far_right_clamps_to_last_slot() {
+        let start = Origin::new(100, 100);
+        let end = Origin::new(10_000, 100);
+
+        TestHarness::new()
+            .with_config(drag_config())
+            .with_windows(3)
+            .on_iteration(1, |world, state| {
+                state.os_move_window(
+                    0,
+                    Origin::new(active_strip_x(world) + 10_000, TEST_MENUBAR_HEIGHT),
+                );
+            })
+            .on_iteration(3, |world, _state| {
+                assert_eq!(active_column_ids(world), vec![1, 2, 0]);
+            })
+            .run(vec![
+                Event::MenuOpened { window_id: 0 },
+                mouse_down(start, Modifiers::empty()),
+                mouse_dragged(end, Modifiers::empty()),
+                mouse_up(end, Modifiers::empty()),
+            ]);
+    }
+}

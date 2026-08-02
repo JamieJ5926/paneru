@@ -2,8 +2,9 @@ use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::With;
+use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Query, Res, ResMut, Single};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
@@ -33,16 +34,19 @@ impl Plugin for MouseEventsPlugin {
             mission_control.is_none_or(|active| !active.0)
         };
 
+        app.init_resource::<DragReorderState>();
         app.add_systems(
             Update,
             (
                 (
                     mouse_moved_trigger,
                     mouse_resize_trigger,
-                    mouse_down_trigger,
+                    (mouse_down_trigger, drag_reorder_trigger).chain(),
                 )
                     .run_if(mission_control_inactive),
-                mouse_up_trigger,
+                mouse_up_trigger
+                    .after(drag_reorder_trigger)
+                    .after(super::systems::window_moved_update_frame),
                 horizontal_warp_mouse_trigger,
             ),
         );
@@ -182,10 +186,14 @@ fn mouse_moved_trigger(
 fn mouse_down_trigger(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    active_workspace: Query<
+        (Entity, &LayoutStrip, Option<&Scrolling>),
+        With<ActiveWorkspaceMarker>,
+    >,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
+    mut drag_reorder: ResMut<DragReorderState>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -193,6 +201,11 @@ fn mouse_down_trigger(
             continue;
         };
         trace!("{point:?}");
+
+        // A new click starts a new gesture, even when it does not land on a
+        // managed window.
+        drag_reorder.down = None;
+        drag_reorder.dragging = None;
 
         let Some((_, entity)) = window_manager
             .find_window_at_point(point)
@@ -203,7 +216,7 @@ fn mouse_down_trigger(
         };
 
         // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
+        for (entity, _, scroll) in &active_workspace {
             if scroll.is_some()
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
@@ -218,6 +231,13 @@ fn mouse_down_trigger(
             }
         }
 
+        if active_workspace
+            .iter()
+            .any(|(_, strip, _)| strip.contains(entity))
+        {
+            drag_reorder.down = Some((origin_from(*point), entity));
+        }
+
         if config.window_hidden_ratio() >= 1.0 {
             // At max hidden ratio, never reshuffle on click.
         } else {
@@ -229,16 +249,123 @@ fn mouse_down_trigger(
     }
 }
 
+#[derive(Default, Resource)]
+struct DragReorderState {
+    down: Option<(Origin, Entity)>,
+    dragging: Option<(Entity, usize)>,
+}
+
+/// Arms a tiled-column reorder after the pointer has moved far enough from a
+/// managed window's title-bar click. macOS keeps moving the actual window;
+/// this system only records the column that should be reordered on mouse-up.
+#[allow(clippy::needless_pass_by_value)]
+fn drag_reorder_trigger(
+    mut messages: MessageReader<Event>,
+    active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    config: Res<Config>,
+    mut state: ResMut<DragReorderState>,
+) {
+    for event in messages.read() {
+        let (point, modifiers) = match event {
+            Event::MouseMoved { point, modifiers } | Event::MouseDragged { point, modifiers } => {
+                (point, modifiers)
+            }
+            _ => continue,
+        };
+
+        if config
+            .mouse_resize_modifier()
+            .is_some_and(|modifier| modifier.matches(*modifiers))
+        {
+            // A modifier drag belongs to the existing resize path. Cancelling
+            // the pending reorder also prevents a later mouse-up from moving a
+            // column after the modifier has been released.
+            state.down = None;
+            state.dragging = None;
+            continue;
+        }
+
+        if state.dragging.is_some() {
+            continue;
+        }
+        let Some((start, entity)) = state.down else {
+            continue;
+        };
+        let point = origin_from(*point);
+        let dx = i64::from(point.x) - i64::from(start.x);
+        let dy = i64::from(point.y) - i64::from(start.y);
+        if dx * dx + dy * dy <= 100 {
+            continue;
+        }
+
+        let Some(strip) = active_workspace.iter().find(|strip| strip.contains(entity)) else {
+            state.down = None;
+            continue;
+        };
+        let Ok(index) = strip.index_of(entity) else {
+            state.down = None;
+            continue;
+        };
+        state.dragging = Some((entity, index));
+    }
+}
+
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
 /// window slides into view after the user releases the button.
 #[allow(clippy::needless_pass_by_value)]
 fn mouse_up_trigger(
     mut messages: MessageReader<Event>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    windows: Windows,
+    mut active_workspace: Query<(&mut LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
+    config: Res<Config>,
+    mut drag_reorder: ResMut<DragReorderState>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
         if !matches!(event, Event::MouseUp { .. }) {
+            continue;
+        }
+
+        let dragging = drag_reorder.dragging.take();
+        drag_reorder.down = None;
+        let has_held_marker = !mouse_held.is_empty();
+        // A missing marker normally means its timeout fired. At the maximum
+        // hidden ratio, however, mouse-down deliberately does not spawn one.
+        if !has_held_marker && (dragging.is_none() || config.window_hidden_ratio() < 1.0) {
+            continue;
+        }
+
+        if let Some((entity, original_index)) = dragging {
+            if let Ok((mut strip, strip_position)) = active_workspace.single_mut()
+                && strip.index_of(entity).ok() == Some(original_index)
+                && let Some(frame) = windows.frame(entity)
+            {
+                let frame_x = frame.min.x - strip_position.0.x;
+                let frame_center_x = frame.center().x - strip_position.0.x;
+                // Keep the source slot in the candidates so a drag that
+                // remains nearest to its original slot is a no-op.
+                let slots = strip
+                    .column_positions(config.inner_gap(), &|column_entity| {
+                        windows.frame(column_entity)
+                    })
+                    .enumerate()
+                    .map(|(index, (_, x))| (index, x))
+                    .collect::<Vec<_>>();
+
+                if let Some(target) = nearest_slot(&slots, frame_x, frame_center_x) {
+                    let target = target.min(strip.len().saturating_sub(1));
+                    if target != original_index {
+                        move_column(&mut strip, original_index, target);
+                    }
+                }
+            }
+
+            for (held_entity, _) in &mouse_held {
+                if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
+                    entity_commands.try_despawn();
+                }
+            }
             continue;
         }
 
@@ -247,6 +374,36 @@ fn mouse_up_trigger(
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }
+        }
+    }
+}
+
+fn nearest_slot(slots: &[(usize, i32)], frame_x: i32, frame_center_x: i32) -> Option<usize> {
+    let nearest_distance = slots
+        .iter()
+        .map(|(_, x)| (i64::from(*x) - i64::from(frame_x)).abs())
+        .min()?;
+    let nearest = slots
+        .iter()
+        .filter(|(_, x)| (i64::from(*x) - i64::from(frame_x)).abs() == nearest_distance)
+        .collect::<Vec<_>>();
+
+    nearest
+        .iter()
+        .filter(|(_, x)| *x >= frame_center_x)
+        .min_by_key(|(_, x)| *x)
+        .or_else(|| nearest.last())
+        .map(|(index, _)| *index)
+}
+
+fn move_column(strip: &mut LayoutStrip, from: usize, to: usize) {
+    if from < to {
+        for index in from..to {
+            strip.swap(index, index + 1);
+        }
+    } else {
+        for index in (to..from).rev() {
+            strip.swap(index, index + 1);
         }
     }
 }
@@ -543,5 +700,12 @@ mod tests {
             Some(&dock),
             &config
         ));
+    }
+
+    #[test]
+    fn nearest_slot_tie_prefers_the_slot_right_of_window_center() {
+        let slots = [(0, 0), (1, 400), (2, 800)];
+
+        assert_eq!(nearest_slot(&slots, 600, 800), Some(2));
     }
 }
