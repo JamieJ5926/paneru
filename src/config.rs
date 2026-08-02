@@ -420,6 +420,7 @@ fn parse_canvas_operation(argv: &[&str]) -> Result<CanvasOperation> {
         "home" => CanvasOperation::Home(display_uuid),
         "fit-all" => CanvasOperation::FitAll(display_uuid),
         "snap" => CanvasOperation::Snap(display_uuid),
+        "auto-place" => CanvasOperation::AutoPlace(display_uuid),
         _ => {
             return Err(err());
         }

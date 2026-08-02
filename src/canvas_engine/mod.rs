@@ -9,4 +9,5 @@ pub mod camera;
 pub mod cluster;
 pub mod geom;
 pub mod momentum;
+pub mod placement;
 pub mod snap;

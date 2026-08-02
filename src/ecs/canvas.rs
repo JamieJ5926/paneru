@@ -33,6 +33,7 @@ use crate::canvas_engine::camera::{
 use crate::canvas_engine::cluster::Side;
 use crate::canvas_engine::geom::{Pt, Rect};
 use crate::canvas_engine::momentum::MomentumState;
+use crate::canvas_engine::placement::grid_positions;
 use crate::canvas_engine::snap::{SnapRect, snap_candidates};
 use crate::config::Config;
 use crate::ecs::{CanvasManaged, Unmanaged};
@@ -502,4 +503,34 @@ fn snap_rect(rect: Rect) -> SnapRect {
         y_low: rect.y,
         y_high: rect.y + rect.h,
     }
+}
+
+/// `canvas auto-place`: arranges every (non-suspended) surface in a
+/// deterministic flow grid inside the viewport, preserving the stable
+/// WinID order. Slot size tracks the largest surface.
+pub fn canvas_auto_place(world: &mut CanvasWorld, viewport: Rect, margin: f64) {
+    let rects = world
+        .surfaces
+        .iter()
+        .filter(|(_, surface)| !surface.suspended)
+        .map(|(_, surface)| surface.world)
+        .collect::<Vec<_>>();
+    let positions = grid_positions(&rects, viewport, margin);
+    let mut index = 0;
+    for (_, surface) in world
+        .surfaces
+        .iter_mut()
+        .filter(|(_, surface)| !surface.suspended)
+    {
+        if let Some(position) = positions.get(index) {
+            surface.world = Rect::new(
+                position.x,
+                position.y,
+                surface.world.w,
+                surface.world.h,
+            );
+        }
+        index += 1;
+    }
+    world.momentum.stop();
 }

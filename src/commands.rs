@@ -15,7 +15,8 @@ mod query;
 use crate::canvas_engine::geom::Rect;
 use crate::config::Config;
 use crate::ecs::canvas::{
-    CanvasWorlds, canvas_fit_all, canvas_home, canvas_pan, canvas_snap, canvas_zoom,
+    CanvasWorlds, canvas_auto_place, canvas_fit_all, canvas_home, canvas_pan, canvas_snap,
+    canvas_zoom,
 };
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
@@ -148,6 +149,9 @@ pub enum CanvasOperation {
     /// `canvas snap [display-uuid]` — tighten near-miss edges to exact
     /// adjacency within the world (diagonal contacts rejected).
     Snap(Option<String>),
+    /// `canvas auto-place [display-uuid]` — arrange every surface in a
+    /// deterministic flow grid inside the viewport.
+    AutoPlace(Option<String>),
 }
 
 /// Defines operations that can be performed on the mouse.
@@ -1702,7 +1706,8 @@ fn resolve_canvas_display_uuid(
         | CanvasOperation::Zoom(_, _, _, uuid)
         | CanvasOperation::Home(uuid)
         | CanvasOperation::FitAll(uuid)
-        | CanvasOperation::Snap(uuid) => uuid.as_deref(),
+        | CanvasOperation::Snap(uuid)
+        | CanvasOperation::AutoPlace(uuid) => uuid.as_deref(),
     };
     let canvas_displays = displays
         .iter()
@@ -1769,6 +1774,7 @@ fn canvas_command_handler(
             CanvasOperation::Home(_) => canvas_home(world, viewport),
             CanvasOperation::FitAll(_) => canvas_fit_all(world, viewport),
             CanvasOperation::Snap(_) => canvas_snap(world),
+            CanvasOperation::AutoPlace(_) => canvas_auto_place(world, viewport, 10.0),
         }
         info!("canvas: applied {op:?} on display {uuid}");
     }
